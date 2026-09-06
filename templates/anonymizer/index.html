@@ -160,8 +160,15 @@
         <!-- Bottom Operational Controls -->
         <footer class="bg-[#0c0c0e] border border-zinc-800/80 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
             
-            <!-- Selection Toggles -->
-            <div class="flex items-center gap-2">
+            <!-- Quick Batch Actions -->
+            <div class="flex items-center flex-wrap gap-2">
+                <button type="button" id="btnAutoRedact" disabled class="disabled:opacity-30 disabled:cursor-not-allowed inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-emerald-300 hover:bg-emerald-900/60 hover:text-white text-xs font-medium transition-all duration-200 shadow-sm">
+                    <svg class="w-3.5 h-3.5 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                    </svg>
+                    <span>سانسور خودکار همه</span>
+                </button>
+
                 <button type="button" id="btnSelectAll" disabled class="disabled:opacity-30 disabled:cursor-not-allowed inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 hover:text-white text-xs font-medium transition-all duration-200">
                     <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="20 6 9 17 4 12"/>
@@ -178,8 +185,18 @@
                 </button>
             </div>
 
-            <!-- Export / Download Action -->
-            <div>
+            <!-- Comparison & Export Actions -->
+            <div class="flex items-center gap-2.5">
+                <!-- Before/After Comparison (Hold to Peek) -->
+                <button type="button" id="btnCompare" disabled class="disabled:opacity-30 disabled:cursor-not-allowed select-none inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 hover:text-white text-xs font-medium transition-all duration-200 active:bg-cyan-950 active:border-cyan-800 active:text-cyan-300" title="برای دیدن تصویر خام اصلی کلیک را نگه دارید">
+                    <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                        <circle cx="12" cy="12" r="3"/>
+                    </svg>
+                    <span>مقایسه قبل/بعد (نگه‌دارید)</span>
+                </button>
+
+                <!-- Export Clean Image Action -->
                 <button type="button" id="btnExport" disabled class="disabled:opacity-30 disabled:cursor-not-allowed inline-flex items-center gap-2 px-4 py-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 text-xs font-semibold transition-all duration-200 shadow-sm active:scale-[0.98]">
                     <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>

@@ -1,11 +1,16 @@
 /**
- * Privacy Auto-Anonymizer - Human-in-the-Loop & Interactive Masking
- * Real-time HTML5 Canvas rendering engine with client-side DP-Pix and Solid Black Box filters.
+ * Privacy Auto-Anonymizer - Day 7: Final Completion, Client-Side Export & Comparison
+ *
+ * Full client-side architecture:
+ * 1. Clean Export (1:1 Native resolution, 0 helper graphics, 100% privacy preserving)
+ * 2. Full-Auto Redaction Mode (one-click instant sanitization)
+ * 3. Before/After Comparison Tool (Hold-to-Peek & Spacebar toggle)
+ * 4. Human-in-the-Loop interactive masking (DP-Pix & Solid Black Box)
  *
  * Grounded in:
- * 1. ReGenHuman (2026 - arXiv:2606.14972): Human-in-the-Loop interactive redaction.
- * 2. Explainability-Driven Incremental Image Anonymization (2025): DP-Pix mosaic + stochastic perturbation.
- * 3. RedactionBench (2026 - arXiv:2606.18782): Zero-entropy Solid Black Box masking for textual confidentiality.
+ * - ReGenHuman (2026): Interactive Human-in-the-Loop curation.
+ * - Incremental Image Anonymization (2025): DP-Pix differential privacy pixelation.
+ * - RedactionBench (2026): Zero-entropy Contextual Integrity masking.
  */
 
 class AnonymizerStudio {
@@ -22,8 +27,10 @@ class AnonymizerStudio {
         this.legendContainer = document.getElementById('legendContainer');
 
         // Control Buttons
+        this.btnAutoRedact = document.getElementById('btnAutoRedact');
         this.btnSelectAll = document.getElementById('btnSelectAll');
         this.btnDeselectAll = document.getElementById('btnDeselectAll');
+        this.btnCompare = document.getElementById('btnCompare');
         this.btnExport = document.getElementById('btnExport');
 
         // State
@@ -32,6 +39,7 @@ class AnonymizerStudio {
         this.detections = []; // [{ id, type, bbox: [x1, y1, x2, y2], score, isMasked: boolean }]
         this.isProcessing = false;
         this.hoveredDetectionId = null;
+        this.isComparing = false; // When true, renders raw unmasked original image
 
         // Color themes for entities
         this.colorConfig = {
@@ -114,7 +122,18 @@ class AnonymizerStudio {
             }
         });
 
-        // Batch Action Buttons
+        // 1. Full-Auto Redaction Action
+        if (this.btnAutoRedact) {
+            this.btnAutoRedact.addEventListener('click', () => {
+                if (this.detections.length === 0) return;
+                this.detections.forEach(d => d.isMasked = true);
+                this.updateStatusSummary();
+                this.render();
+                this.showToast('تمام عناصر حساس با موفقیت سانسور شدند.');
+            });
+        }
+
+        // 2. Batch Selection Actions
         if (this.btnSelectAll) {
             this.btnSelectAll.addEventListener('click', () => {
                 this.detections.forEach(d => d.isMasked = true);
@@ -129,6 +148,51 @@ class AnonymizerStudio {
                 this.updateStatusSummary();
                 this.render();
             });
+        }
+
+        // 3. Before/After Comparison Tool (Hold to Peek)
+        if (this.btnCompare) {
+            const startCompare = (e) => {
+                e.preventDefault();
+                if (!this.originalImage) return;
+                this.isComparing = true;
+                this.render();
+            };
+
+            const stopCompare = (e) => {
+                e.preventDefault();
+                if (!this.originalImage) return;
+                this.isComparing = false;
+                this.render();
+            };
+
+            this.btnCompare.addEventListener('mousedown', startCompare);
+            this.btnCompare.addEventListener('mouseup', stopCompare);
+            this.btnCompare.addEventListener('mouseleave', stopCompare);
+            this.btnCompare.addEventListener('touchstart', startCompare, { passive: false });
+            this.btnCompare.addEventListener('touchend', stopCompare, { passive: false });
+        }
+
+        // Spacebar shortcut for Before/After peek
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && e.target === document.body && this.originalImage && !this.isComparing) {
+                e.preventDefault();
+                this.isComparing = true;
+                this.render();
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'Space' && this.isComparing) {
+                e.preventDefault();
+                this.isComparing = false;
+                this.render();
+            }
+        });
+
+        // 4. Clean Export Action
+        if (this.btnExport) {
+            this.btnExport.addEventListener('click', () => this.exportCleanImage());
         }
     }
 
@@ -149,6 +213,8 @@ class AnonymizerStudio {
      * Hit testing: Finds detections overlapping coordinates, prioritizing smaller areas.
      */
     findHitDetection(x, y) {
+        if (this.isComparing) return null;
+
         const hits = this.detections.filter(det => {
             const [x1, y1, x2, y2] = det.bbox;
             return x >= x1 && x <= x2 && y >= y1 && y <= y2;
@@ -156,7 +222,7 @@ class AnonymizerStudio {
 
         if (hits.length === 0) return null;
 
-        // If multiple overlapping boxes hit, prioritize the one with smaller area
+        // Prioritize smaller area for nested/adjacent bounding boxes
         hits.sort((a, b) => {
             const areaA = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
             const areaB = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
@@ -170,7 +236,7 @@ class AnonymizerStudio {
      * Interactive Click Handler: Toggles isMasked between true and false.
      */
     handleCanvasClick(e) {
-        if (!this.originalImage || this.detections.length === 0) return;
+        if (!this.originalImage || this.detections.length === 0 || this.isComparing) return;
 
         const { x, y } = this.getCanvasCoordinates(e);
         const hit = this.findHitDetection(x, y);
@@ -186,7 +252,7 @@ class AnonymizerStudio {
      * Mouse Move Handler: Cursor styling & subtle hover highlight.
      */
     handleCanvasMouseMove(e) {
-        if (!this.originalImage || this.detections.length === 0) return;
+        if (!this.originalImage || this.detections.length === 0 || this.isComparing) return;
 
         const { x, y } = this.getCanvasCoordinates(e);
         const hit = this.findHitDetection(x, y);
@@ -265,7 +331,7 @@ class AnonymizerStudio {
 
             const data = await response.json();
             if (data.status === 'success' && Array.isArray(data.detections)) {
-                // Initialize detections with default isMasked = false (ready for interactive selection)
+                // Initialize detections ready for interaction
                 this.detections = data.detections.map(det => ({
                     ...det,
                     isMasked: false
@@ -304,7 +370,7 @@ class AnonymizerStudio {
     }
 
     enableControls(enabled) {
-        [this.btnSelectAll, this.btnDeselectAll, this.btnExport].forEach(btn => {
+        [this.btnAutoRedact, this.btnSelectAll, this.btnDeselectAll, this.btnCompare, this.btnExport].forEach(btn => {
             if (btn) {
                 btn.disabled = !enabled;
             }
@@ -334,9 +400,8 @@ class AnonymizerStudio {
 
     /**
      * Master Render Loop:
-     * 1. Draw base image
-     * 2. Apply active masks (DP-Pix for faces/plates, Solid Black for text)
-     * 3. Draw bounding boxes & labels for unmasked suggestions and masked badges
+     * - If isComparing is active: renders pure unmasked original image.
+     * - Otherwise: renders original image + active masks + interactive suggestion boxes.
      */
     render() {
         if (!this.originalImage) return;
@@ -348,14 +413,20 @@ class AnonymizerStudio {
         ctx.clearRect(0, 0, width, height);
         ctx.drawImage(this.originalImage, 0, 0, width, height);
 
-        // 2. Apply active masks
+        // Before/After comparison view: stop here and display indicator
+        if (this.isComparing) {
+            this.drawComparisonWatermark(ctx, width, height);
+            return;
+        }
+
+        // 2. Apply active masks (DP-Pix for faces/plates, Solid Black for text)
         this.detections.forEach(det => {
             if (det.isMasked) {
-                this.applyClientMask(ctx, det);
+                this.applyClientMask(ctx, det, width, height);
             }
         });
 
-        // 3. Draw overlays (neon suggestions for unmasked, indicator badge for masked)
+        // 3. Draw overlays (neon suggestions for unmasked, status badges for masked)
         this.detections.forEach(det => {
             const isHovered = (this.hoveredDetectionId === det.id);
             if (det.isMasked) {
@@ -366,17 +437,49 @@ class AnonymizerStudio {
         });
     }
 
+    drawComparisonWatermark(ctx, width, height) {
+        ctx.save();
+        const text = 'تصویر اصلی خام (قبل از پالایش)';
+        const fontSize = Math.max(13, Math.min(18, Math.round(width / 50)));
+        ctx.font = `600 ${fontSize}px Inter, Vazirmatn, sans-serif`;
+
+        const paddingX = 14;
+        const paddingY = 8;
+        const metrics = ctx.measureText(text);
+        const badgeW = metrics.width + paddingX * 2;
+        const badgeH = fontSize + paddingY * 2;
+
+        const x = (width - badgeW) / 2;
+        const y = 20;
+
+        ctx.fillStyle = 'rgba(9, 9, 11, 0.85)';
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.6)';
+        ctx.shadowBlur = 10;
+        this.roundRect(ctx, x, y, badgeW, badgeH, 6);
+        ctx.fill();
+
+        ctx.strokeStyle = 'rgba(6, 182, 212, 0.8)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowBlur = 0;
+        ctx.textBaseline = 'middle';
+        ctx.fillText(text, x + paddingX, y + (badgeH / 2));
+        ctx.restore();
+    }
+
     /**
      * High-Performance Client-Side Redaction Filter Execution:
      * - text: Solid Black Box (#000000)
-     * - face / plate: DP-Pix (Mosaic downsampling + additive Gaussian noise)
+     * - face / plate: DP-Pix (Mosaic downsampling + additive Gaussian/Laplace noise)
      */
-    applyClientMask(ctx, det) {
+    applyClientMask(ctx, det, canvasW, canvasH) {
         let [x1, y1, x2, y2] = det.bbox;
-        x1 = Math.max(0, Math.min(x1, this.canvas.width));
-        y1 = Math.max(0, Math.min(y1, this.canvas.height));
-        x2 = Math.max(0, Math.min(x2, this.canvas.width));
-        y2 = Math.max(0, Math.min(y2, this.canvas.height));
+        x1 = Math.max(0, Math.min(x1, canvasW));
+        y1 = Math.max(0, Math.min(y1, canvasH));
+        x2 = Math.max(0, Math.min(x2, canvasW));
+        y2 = Math.max(0, Math.min(y2, canvasH));
 
         const w = x2 - x1;
         const h = y2 - y1;
@@ -438,7 +541,7 @@ class AnonymizerStudio {
 
                 ctx.putImageData(imgData, x1, y1);
             } catch (err) {
-                console.warn('[Anonymizer] Fallback to solid mask on canvas security limits:', err);
+                console.warn('[Anonymizer] Fallback to solid mask on canvas limits:', err);
                 ctx.fillStyle = '#18181b';
                 ctx.fillRect(x1, y1, w, h);
             }
@@ -596,6 +699,86 @@ class AnonymizerStudio {
         ctx.lineTo(x, y + radius);
         ctx.quadraticCurveTo(x, y, x + radius, y);
         ctx.closePath();
+    }
+
+    /**
+     * Clean Export Method:
+     * Generates sanitized image directly on an off-screen canvas at native 1:1 resolution.
+     * Strictly avoids rendering helper boxes, neon outlines, pills, or text labels.
+     */
+    exportCleanImage() {
+        if (!this.originalImage) {
+            alert('تصویری جهت استخراج وجود ندارد.');
+            return;
+        }
+
+        const nativeWidth = this.originalImage.naturalWidth;
+        const nativeHeight = this.originalImage.naturalHeight;
+
+        // Create off-screen canvas for 100% clean rendering
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = nativeWidth;
+        offCanvas.height = nativeHeight;
+        const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+
+        // 1. Draw pure original image
+        offCtx.drawImage(this.originalImage, 0, 0, nativeWidth, nativeHeight);
+
+        // 2. Apply ONLY active masks (DP-Pix & Solid Black) without helper UI elements
+        this.detections.forEach(det => {
+            if (det.isMasked) {
+                this.applyClientMask(offCtx, det, nativeWidth, nativeHeight);
+            }
+        });
+
+        // 3. Trigger direct client-side download via Blob URL
+        offCanvas.toBlob((blob) => {
+            if (!blob) {
+                alert('خطا در ایجاد فایل نهایی.');
+                return;
+            }
+
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const originalName = this.currentFile ? this.currentFile.name.replace(/\.[^/.]+$/, '') : 'document';
+            a.download = `redacted_${originalName}.png`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            this.showToast(`تصویر پالایش‌شده با موفقیت دانلود شد: redacted_${originalName}.png`);
+        }, 'image/png');
+    }
+
+    /**
+     * Non-intrusive floating toast notification.
+     */
+    showToast(message) {
+        const existingToast = document.getElementById('studioToast');
+        if (existingToast) existingToast.remove();
+
+        const toast = document.createElement('div');
+        toast.id = 'studioToast';
+        toast.className = 'fixed bottom-20 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg bg-zinc-900/95 border border-zinc-700 text-zinc-100 text-xs font-medium shadow-2xl flex items-center gap-2 backdrop-blur-md transition-all duration-300 transform opacity-0 translate-y-2';
+        toast.innerHTML = `
+            <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+            <span>${message}</span>
+        `;
+        document.body.appendChild(toast);
+
+        // Animate in
+        requestAnimationFrame(() => {
+            toast.classList.remove('opacity-0', 'translate-y-2');
+            toast.classList.add('opacity-100', 'translate-y-0');
+        });
+
+        // Auto remove after 3.5s
+        setTimeout(() => {
+            toast.classList.remove('opacity-100', 'translate-y-0');
+            toast.classList.add('opacity-0', 'translate-y-2');
+            setTimeout(() => toast.remove(), 300);
+        }, 3500);
     }
 }
 
