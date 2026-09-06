@@ -62,3 +62,7 @@ Thumbs.db
 # Project Scratch & Temp Files
 scratch/
 .tmp/
+
+# Internal Developer Notes & Context
+PROJECT_MEMORY.md
+RESEARCH_PAPERS.md
