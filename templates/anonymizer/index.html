@@ -143,8 +143,14 @@
                 <input type="file" id="dropzoneFileInput" accept="image/*" class="hidden">
             </div>
 
-            <!-- HTML5 Canvas Preview Element -->
-            <canvas id="editor-canvas" class="hidden max-w-full max-h-[72vh] rounded-lg shadow-2xl z-10 object-contain"></canvas>
+            <!-- Canvas HUD Container (Relative positioning for SVG Connectors & HTML Callouts) -->
+            <div id="canvasContainer" class="relative hidden max-w-full max-h-[72vh] z-10">
+                <canvas id="editor-canvas" class="block max-w-full max-h-[72vh] rounded-lg shadow-2xl object-contain"></canvas>
+                <!-- SVG Connector Lines Layer -->
+                <svg id="connector-layer" class="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible"></svg>
+                <!-- HTML Callout Labels Layer -->
+                <div id="labels-layer" class="absolute inset-0 w-full h-full pointer-events-none z-20 overflow-visible"></div>
+            </div>
 
             <!-- Loading Spinner Overlay -->
             <div id="loadingOverlay" class="hidden absolute inset-0 z-30 bg-[#09090b]/80 backdrop-blur-sm flex-col items-center justify-center rounded-xl transition-all duration-300">

@@ -17,6 +17,9 @@ class AnonymizerStudio {
     constructor() {
         // DOM Elements
         this.canvas = document.getElementById('editor-canvas') || document.getElementById('imageCanvas');
+        this.canvasContainer = document.getElementById('canvasContainer');
+        this.connectorLayer = document.getElementById('connector-layer');
+        this.labelsLayer = document.getElementById('labels-layer');
         this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
         this.dropzone = document.getElementById('dropzoneContainer');
         this.placeholder = document.getElementById('placeholderState');
@@ -41,35 +44,27 @@ class AnonymizerStudio {
         this.hoveredDetectionId = null;
         this.isComparing = false; // When true, renders raw unmasked original image
 
-        // Color themes for entities (English labels avoid Canvas RTL character disjointing)
+        // Color themes for entities
         this.colorConfig = {
             face: {
                 stroke: '#06b6d4',      // Neon Cyan
                 fill: 'rgba(6, 182, 212, 0.15)',
-                badgeBg: '#06b6d4',     // Solid 100% opacity to prevent text bleed-through
-                badgeText: '#ffffff',
-                label: 'Face'
+                label: 'چهره (Face)'
             },
             plate: {
                 stroke: '#10b981',     // Neon Emerald
                 fill: 'rgba(16, 185, 129, 0.15)',
-                badgeBg: '#10b981',    // Solid 100% opacity
-                badgeText: '#ffffff',
-                label: 'Plate'
+                label: 'پلاک خودرو (Plate)'
             },
             text: {
                 stroke: '#f59e0b',      // Neon Amber
                 fill: 'rgba(245, 158, 11, 0.15)',
-                badgeBg: '#f59e0b',     // Solid 100% opacity
-                badgeText: '#ffffff',
-                label: 'Sensitive Text'
+                label: 'متن حساس (Text)'
             },
             default: {
                 stroke: '#8b5cf6',
                 fill: 'rgba(139, 92, 246, 0.15)',
-                badgeBg: '#8b5cf6',
-                badgeText: '#ffffff',
-                label: 'Sensitive Entity'
+                label: 'عنصر حساس'
             }
         };
 
@@ -190,6 +185,13 @@ class AnonymizerStudio {
             }
         });
 
+        // Responsive HUD Callouts on Window Resize
+        window.addEventListener('resize', () => {
+            if (this.originalImage) {
+                this.render();
+            }
+        });
+
         // 4. Clean Export Action
         if (this.btnExport) {
             this.btnExport.addEventListener('click', () => this.exportCleanImage());
@@ -293,10 +295,11 @@ class AnonymizerStudio {
 
                 // Adjust UI visibility
                 if (this.placeholder) this.placeholder.classList.add('hidden');
+                if (this.canvasContainer) this.canvasContainer.classList.remove('hidden');
                 this.canvas.classList.remove('hidden');
                 if (this.dropzone) {
-                    this.dropzone.classList.remove('border-dashed');
-                    this.dropzone.classList.add('border-solid');
+                    this.dropzone.classList.remove('border-dashed', 'overflow-hidden');
+                    this.dropzone.classList.add('border-solid', 'overflow-visible');
                 }
 
                 // Initial render of raw image
@@ -413,8 +416,9 @@ class AnonymizerStudio {
         ctx.clearRect(0, 0, width, height);
         ctx.drawImage(this.originalImage, 0, 0, width, height);
 
-        // Before/After comparison view: stop here and display indicator
+        // Before/After comparison view: stop here, clear HUD callouts, and display watermark
         if (this.isComparing) {
+            this.clearCalloutLayers();
             this.drawComparisonWatermark(ctx, width, height);
             return;
         }
@@ -426,7 +430,7 @@ class AnonymizerStudio {
             }
         });
 
-        // 3. Draw overlays (neon suggestions for unmasked, status badges for masked)
+        // 3. Draw overlays on canvas (ONLY strokes and corner accents, NO text)
         this.detections.forEach(det => {
             const isHovered = (this.hoveredDetectionId === det.id);
             if (det.isMasked) {
@@ -435,6 +439,9 @@ class AnonymizerStudio {
                 this.drawSuggestionBox(ctx, det, isHovered);
             }
         });
+
+        // 4. Render modern HUD Callouts (SVG connector lines + HTML interactive badges)
+        this.renderHUDCallouts();
     }
 
     drawComparisonWatermark(ctx, width, height) {
@@ -549,7 +556,7 @@ class AnonymizerStudio {
     }
 
     /**
-     * Renders an unmasked suggestion box with neon styling and type badge.
+     * Renders an unmasked suggestion box with neon styling (strokes and corners only).
      */
     drawSuggestionBox(ctx, det, isHovered) {
         const [x1, y1, x2, y2] = det.bbox;
@@ -576,16 +583,11 @@ class AnonymizerStudio {
         // Corner accents
         this.drawCornerAccents(ctx, x1, y1, boxWidth, boxHeight, config.stroke);
 
-        // Pill label
-        const scorePercent = Math.round(det.score * 100);
-        const labelText = `${config.label} ${scorePercent}%`;
-        this.drawBadgePill(ctx, x1, y1, labelText, config.badgeBg, config.badgeText, false);
-
         ctx.restore();
     }
 
     /**
-     * Renders a masked area overlay (subtle border + [✓ ماسک شد] badge).
+     * Renders a masked area overlay (subtle border without canvas text).
      */
     drawMaskedOverlay(ctx, det, isHovered) {
         const [x1, y1, x2, y2] = det.bbox;
@@ -597,15 +599,10 @@ class AnonymizerStudio {
         ctx.save();
 
         // Clean subtle border indicating active redaction
-        ctx.strokeStyle = isHovered ? 'rgba(239, 68, 68, 0.8)' : 'rgba(16, 185, 129, 0.6)';
+        ctx.strokeStyle = isHovered ? 'rgba(239, 68, 68, 0.9)' : 'rgba(16, 185, 129, 0.7)';
         ctx.lineWidth = 1.5;
         ctx.setLineDash(isHovered ? [4, 4] : []);
         ctx.strokeRect(x1, y1, boxWidth, boxHeight);
-
-        // Masked status badge in clean English
-        const badgeText = isHovered ? 'Click to Unmask' : '✓ Masked';
-        const badgeBg = isHovered ? '#ef4444' : '#10b981';
-        this.drawBadgePill(ctx, x1, y1, badgeText, badgeBg, '#ffffff', true);
 
         ctx.restore();
     }
@@ -648,41 +645,230 @@ class AnonymizerStudio {
         ctx.restore();
     }
 
-    drawBadgePill(ctx, x, y, text, bgColor, textColor, isMasked) {
-        const fontSize = Math.max(12, Math.min(15, Math.round(this.canvas.width / 65)));
-        ctx.font = `600 ${fontSize}px Inter, -apple-system, sans-serif`;
-
-        const paddingX = 8;
-        const paddingY = 4;
-        const textMetrics = ctx.measureText(text);
-        const badgeWidth = textMetrics.width + (paddingX * 2);
-        const badgeHeight = fontSize + (paddingY * 2);
-
-        let badgeY = y - badgeHeight - 4;
-        if (badgeY < 4) {
-            badgeY = y + 4;
+    /**
+     * Clears both SVG connector lines and HTML callout labels.
+     */
+    clearCalloutLayers() {
+        if (this.connectorLayer) {
+            this.connectorLayer.innerHTML = '';
         }
-
-        let badgeX = x;
-        if (badgeX + badgeWidth > this.canvas.width - 4) {
-            badgeX = this.canvas.width - badgeWidth - 4;
+        if (this.labelsLayer) {
+            this.labelsLayer.innerHTML = '';
         }
+    }
 
-        ctx.save();
-        // Fully solid background (Opacity = 1.0) to eliminate text bleed-through
-        ctx.globalAlpha = 1.0;
-        ctx.fillStyle = bgColor;
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.6)';
-        ctx.shadowBlur = 6;
-        this.roundRect(ctx, badgeX, badgeY, badgeWidth, badgeHeight, 4);
-        ctx.fill();
+    /**
+     * Modern HUD Callout Architecture:
+     * Renders angled SVG polyline connectors and floating HTML callout badges
+     * positioned around the detected boxes. Eliminates Canvas text rendering
+     * artifacts and provides flawless RTL Persian text presentation.
+     */
+    renderHUDCallouts() {
+        this.clearCalloutLayers();
+        if (!this.connectorLayer || !this.labelsLayer || this.detections.length === 0) return;
 
-        // Draw crisp text
-        ctx.fillStyle = textColor;
-        ctx.shadowBlur = 0;
-        ctx.textBaseline = 'middle';
-        ctx.fillText(text, badgeX + paddingX, badgeY + (badgeHeight / 2));
-        ctx.restore();
+        const rect = this.canvas.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+
+        const scaleX = rect.width / this.canvas.width;
+        const scaleY = rect.height / this.canvas.height;
+
+        // Prepare detection coordinate data mapped to rendered DOM pixels
+        const items = this.detections.map(det => {
+            const [x1, y1, x2, y2] = det.bbox;
+            const sx1 = x1 * scaleX;
+            const sy1 = y1 * scaleY;
+            const sx2 = x2 * scaleX;
+            const sy2 = y2 * scaleY;
+            const boxCenterX = (sx1 + sx2) / 2;
+            const boxCenterY = (sy1 + sy2) / 2;
+
+            // Intelligent branch direction: Left or Right based on center and margin distance
+            let direction = (boxCenterX >= rect.width / 2) ? 'right' : 'left';
+            if (direction === 'right' && (rect.width - sx2 < 70) && sx1 > 90) {
+                direction = 'left';
+            } else if (direction === 'left' && sx1 < 70 && (rect.width - sx2 > 90)) {
+                direction = 'right';
+            }
+
+            return {
+                det,
+                sx1, sy1, sx2, sy2,
+                boxWidth: sx2 - sx1,
+                boxHeight: sy2 - sy1,
+                boxCenterX, boxCenterY,
+                direction,
+                targetY: boxCenterY
+            };
+        });
+
+        // Vertical collision avoidance: prevents callout badges on the same side from overlapping
+        ['left', 'right'].forEach(dir => {
+            const group = items.filter(it => it.direction === dir);
+            group.sort((a, b) => a.boxCenterY - b.boxCenterY);
+
+            const minSpacing = 42; // Vertical badge height + breathing room
+
+            // Downward adjustment pass
+            for (let i = 1; i < group.length; i++) {
+                if (group[i].targetY < group[i - 1].targetY + minSpacing) {
+                    group[i].targetY = group[i - 1].targetY + minSpacing;
+                }
+            }
+
+            // Upward clamp pass so badges don't overflow the viewport boundaries
+            for (let i = group.length - 1; i >= 0; i--) {
+                const maxAllowed = Math.max(22, rect.height - 24 - (group.length - 1 - i) * minSpacing);
+                if (group[i].targetY > maxAllowed) {
+                    group[i].targetY = maxAllowed;
+                }
+                const minAllowed = 22 + i * minSpacing;
+                if (group[i].targetY < minAllowed) {
+                    group[i].targetY = minAllowed;
+                }
+            }
+        });
+
+        // Document fragments for fast atomic DOM insertion
+        const svgFragment = document.createDocumentFragment();
+        const htmlFragment = document.createDocumentFragment();
+
+        items.forEach(item => {
+            const { det, sx1, sy1, sx2, sy2, boxCenterY, direction, targetY } = item;
+            const config = this.colorConfig[det.type] || this.colorConfig.default;
+            const isHovered = (this.hoveredDetectionId === det.id);
+            const isMasked = det.isMasked;
+            const strokeColor = isMasked ? (isHovered ? '#ef4444' : '#10b981') : config.stroke;
+
+            // Connector Geometry:
+            // p0: Anchor point on the box boundary
+            // p1: Short horizontal stub stepping outward
+            // p2: Angled diagonal dogleg leading to target Y level
+            // p3: Horizontal arm arriving at HTML label
+            let p0, p1, p2, p3;
+            const stubLen = 14;
+            const doglegLen = 26;
+            const armLen = 24;
+
+            if (direction === 'right') {
+                p0 = { x: sx2, y: boxCenterY };
+                p1 = { x: sx2 + stubLen, y: boxCenterY };
+                p2 = { x: sx2 + stubLen + doglegLen, y: targetY };
+                p3 = { x: sx2 + stubLen + doglegLen + armLen, y: targetY };
+            } else {
+                p0 = { x: sx1, y: boxCenterY };
+                p1 = { x: sx1 - stubLen, y: boxCenterY };
+                p2 = { x: sx1 - stubLen - doglegLen, y: targetY };
+                p3 = { x: sx1 - stubLen - doglegLen - armLen, y: targetY };
+            }
+
+            // 1. Build SVG Connector Group
+            const groupEl = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            groupEl.setAttribute('class', 'hud-connector transition-all duration-200');
+
+            // Anchor dot on detection box edge
+            const dot0 = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            dot0.setAttribute('cx', p0.x.toFixed(1));
+            dot0.setAttribute('cy', p0.y.toFixed(1));
+            dot0.setAttribute('r', isHovered ? '4' : '3');
+            dot0.setAttribute('fill', strokeColor);
+            groupEl.appendChild(dot0);
+
+            // Polyline connecting box to callout
+            const polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+            polyline.setAttribute('points', `${p0.x.toFixed(1)},${p0.y.toFixed(1)} ${p1.x.toFixed(1)},${p1.y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)} ${p3.x.toFixed(1)},${p3.y.toFixed(1)}`);
+            polyline.setAttribute('stroke', strokeColor);
+            polyline.setAttribute('stroke-width', isHovered ? '2.2' : '1.5');
+            polyline.setAttribute('stroke-linecap', 'round');
+            polyline.setAttribute('stroke-linejoin', 'round');
+            polyline.setAttribute('fill', 'none');
+            polyline.setAttribute('opacity', isHovered ? '1' : (isMasked ? '0.75' : '0.9'));
+            if (!isMasked && !isHovered) {
+                polyline.setAttribute('stroke-dasharray', '4,3');
+            }
+            groupEl.appendChild(polyline);
+
+            // Terminal dot at label attachment
+            const dot3 = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            dot3.setAttribute('cx', p3.x.toFixed(1));
+            dot3.setAttribute('cy', p3.y.toFixed(1));
+            dot3.setAttribute('r', isHovered ? '3.5' : '2.5');
+            dot3.setAttribute('fill', strokeColor);
+            groupEl.appendChild(dot3);
+
+            svgFragment.appendChild(groupEl);
+
+            // 2. Build HTML Callout Badge
+            const badge = document.createElement('div');
+            badge.dataset.detectionId = det.id;
+
+            // Absolute positioning precisely aligned with connector terminal
+            badge.style.position = 'absolute';
+            badge.style.top = `${p3.y.toFixed(1)}px`;
+            if (direction === 'right') {
+                badge.style.left = `${(p3.x + 4).toFixed(1)}px`;
+                badge.style.transform = 'translate(0, -50%)';
+            } else {
+                badge.style.left = `${(p3.x - 4).toFixed(1)}px`;
+                badge.style.transform = 'translate(-100%, -50%)';
+            }
+
+            // High-contrast HUD aesthetics
+            const borderCol = isMasked
+                ? (isHovered ? 'border-red-500/90 shadow-[0_0_15px_rgba(239,68,68,0.4)]' : 'border-emerald-500/80 shadow-[0_0_12px_rgba(16,185,129,0.3)]')
+                : (isHovered ? 'border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.4)]' : 'border-zinc-700/90 shadow-[0_4px_12px_rgba(0,0,0,0.6)]');
+
+            const bgCol = isHovered
+                ? 'bg-[#141418] text-white scale-[1.04]'
+                : 'bg-[#0f0f13]/95 text-zinc-200';
+
+            const statusBadgeText = isMasked
+                ? (isHovered ? 'لغو ماسک' : '✓ ماسک‌شده')
+                : 'کلیک جهت ماسک';
+
+            const statusBadgeColor = isMasked
+                ? (isHovered ? 'text-red-400 bg-red-950/60 border-red-800/80' : 'text-emerald-400 bg-emerald-950/60 border-emerald-800/80')
+                : 'text-amber-400 bg-amber-950/50 border-amber-800/70';
+
+            const scorePercent = Math.round(det.score * 100);
+
+            badge.className = `pointer-events-auto cursor-pointer select-none px-2.5 py-1.5 rounded-lg border ${borderCol} ${bgCol} text-xs font-medium transition-all duration-150 flex items-center gap-2 backdrop-blur-md whitespace-nowrap z-20 hover:scale-105 active:scale-95 group`;
+
+            badge.innerHTML = `
+                <span class="w-2.5 h-2.5 rounded-full flex-shrink-0 transition-transform duration-200 group-hover:scale-125" style="background-color: ${strokeColor}; box-shadow: 0 0 8px ${strokeColor};"></span>
+                <span class="text-zinc-100 font-medium tracking-tight">${config.label}</span>
+                <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 text-zinc-400 border border-zinc-800">${scorePercent}%</span>
+                <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border ${statusBadgeColor} transition-colors">${statusBadgeText}</span>
+            `;
+
+            // Hover interactions: highlight box, line, and badge
+            badge.addEventListener('mouseenter', () => {
+                if (this.hoveredDetectionId !== det.id) {
+                    this.hoveredDetectionId = det.id;
+                    this.render();
+                }
+            });
+
+            badge.addEventListener('mouseleave', () => {
+                if (this.hoveredDetectionId === det.id) {
+                    this.hoveredDetectionId = null;
+                    this.render();
+                }
+            });
+
+            // Click interaction: toggle isMasked and re-render
+            badge.addEventListener('click', (e) => {
+                e.stopPropagation();
+                det.isMasked = !det.isMasked;
+                this.updateStatusSummary();
+                this.render();
+            });
+
+            htmlFragment.appendChild(badge);
+        });
+
+        this.connectorLayer.appendChild(svgFragment);
+        this.labelsLayer.appendChild(htmlFragment);
     }
 
     roundRect(ctx, x, y, width, height, radius) {
