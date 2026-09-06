@@ -121,7 +121,7 @@ class ModelManager:
             # verbose=False avoids Windows cp1252 charmap encoding errors with progress bar characters
             self._ocr_reader = easyocr.Reader(
                 ['fa', 'en'],
-                gpu=False,
+                gpu=True,
                 model_storage_directory=str(easyocr_storage),
                 verbose=False
             )
@@ -270,7 +270,9 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
             image,
             adjust_contrast=True,
             text_threshold=0.3,
-            low_text=0.3
+            low_text=0.3,
+            canvas_size=1920,
+            mag_ratio=1.0
         )
         for bbox, text, score in ocr_results:
             score = float(score)
