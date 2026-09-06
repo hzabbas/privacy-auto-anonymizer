@@ -1,13 +1,18 @@
 /**
- * Privacy Auto-Anonymizer - Visual Rendering & Canvas Interaction
- * Modern HTML5 Canvas rendering layer with neon bounding boxes and AI inference.
+ * Privacy Auto-Anonymizer - Human-in-the-Loop & Interactive Masking
+ * Real-time HTML5 Canvas rendering engine with client-side DP-Pix and Solid Black Box filters.
+ *
+ * Grounded in:
+ * 1. ReGenHuman (2026 - arXiv:2606.14972): Human-in-the-Loop interactive redaction.
+ * 2. Explainability-Driven Incremental Image Anonymization (2025): DP-Pix mosaic + stochastic perturbation.
+ * 3. RedactionBench (2026 - arXiv:2606.18782): Zero-entropy Solid Black Box masking for textual confidentiality.
  */
 
 class AnonymizerStudio {
     constructor() {
         // DOM Elements
         this.canvas = document.getElementById('editor-canvas') || document.getElementById('imageCanvas');
-        this.ctx = this.canvas.getContext('2d');
+        this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
         this.dropzone = document.getElementById('dropzoneContainer');
         this.placeholder = document.getElementById('placeholderState');
         this.uploadInputs = document.querySelectorAll('input[type="file"]');
@@ -15,7 +20,7 @@ class AnonymizerStudio {
         this.statusBadge = document.getElementById('statusBadge');
         this.statusText = document.getElementById('statusText');
         this.legendContainer = document.getElementById('legendContainer');
-        
+
         // Control Buttons
         this.btnSelectAll = document.getElementById('btnSelectAll');
         this.btnDeselectAll = document.getElementById('btnDeselectAll');
@@ -24,38 +29,39 @@ class AnonymizerStudio {
         // State
         this.originalImage = null;
         this.currentFile = null;
-        this.detections = []; // [{ id, type, bbox: [x1, y1, x2, y2], score, active: true }]
+        this.detections = []; // [{ id, type, bbox: [x1, y1, x2, y2], score, isMasked: boolean }]
         this.isProcessing = false;
+        this.hoveredDetectionId = null;
 
         // Color themes for entities
         this.colorConfig = {
             face: {
                 stroke: '#06b6d4',      // Neon Cyan
                 fill: 'rgba(6, 182, 212, 0.15)',
-                badgeBg: 'rgba(6, 182, 212, 0.90)',
+                badgeBg: 'rgba(6, 182, 212, 0.95)',
                 badgeText: '#ffffff',
-                label: 'Face'
+                label: 'چهره (Face)'
             },
             plate: {
                 stroke: '#10b981',     // Neon Emerald
                 fill: 'rgba(16, 185, 129, 0.15)',
-                badgeBg: 'rgba(16, 185, 129, 0.90)',
+                badgeBg: 'rgba(16, 185, 129, 0.95)',
                 badgeText: '#ffffff',
-                label: 'Plate'
+                label: 'پلاک (Plate)'
             },
             text: {
                 stroke: '#f59e0b',      // Neon Amber
                 fill: 'rgba(245, 158, 11, 0.15)',
-                badgeBg: 'rgba(245, 158, 11, 0.90)',
+                badgeBg: 'rgba(245, 158, 11, 0.95)',
                 badgeText: '#ffffff',
-                label: 'Text'
+                label: 'متن (Text)'
             },
             default: {
-                stroke: '#8b5cf6',      // Purple fallback
+                stroke: '#8b5cf6',
                 fill: 'rgba(139, 92, 246, 0.15)',
-                badgeBg: 'rgba(139, 92, 246, 0.90)',
+                badgeBg: 'rgba(139, 92, 246, 0.95)',
                 badgeText: '#ffffff',
-                label: 'Entity'
+                label: 'عنصر حساس'
             }
         };
 
@@ -97,19 +103,106 @@ class AnonymizerStudio {
             });
         }
 
-        // Selection buttons
+        // Canvas Click & Hover for Hit Testing (Human-in-the-loop)
+        this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
+        this.canvas.addEventListener('mousemove', (e) => this.handleCanvasMouseMove(e));
+        this.canvas.addEventListener('mouseleave', () => {
+            if (this.hoveredDetectionId !== null) {
+                this.hoveredDetectionId = null;
+                this.canvas.style.cursor = 'default';
+                this.render();
+            }
+        });
+
+        // Batch Action Buttons
         if (this.btnSelectAll) {
             this.btnSelectAll.addEventListener('click', () => {
-                this.detections.forEach(d => d.active = true);
+                this.detections.forEach(d => d.isMasked = true);
+                this.updateStatusSummary();
                 this.render();
             });
         }
 
         if (this.btnDeselectAll) {
             this.btnDeselectAll.addEventListener('click', () => {
-                this.detections.forEach(d => d.active = false);
+                this.detections.forEach(d => d.isMasked = false);
+                this.updateStatusSummary();
                 this.render();
             });
+        }
+    }
+
+    /**
+     * Translates viewport screen mouse coordinates to native canvas image pixels.
+     */
+    getCanvasCoordinates(e) {
+        const rect = this.canvas.getBoundingClientRect();
+        const scaleX = this.canvas.width / rect.width;
+        const scaleY = this.canvas.height / rect.height;
+        return {
+            x: (e.clientX - rect.left) * scaleX,
+            y: (e.clientY - rect.top) * scaleY
+        };
+    }
+
+    /**
+     * Hit testing: Finds detections overlapping coordinates, prioritizing smaller areas.
+     */
+    findHitDetection(x, y) {
+        const hits = this.detections.filter(det => {
+            const [x1, y1, x2, y2] = det.bbox;
+            return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+        });
+
+        if (hits.length === 0) return null;
+
+        // If multiple overlapping boxes hit, prioritize the one with smaller area
+        hits.sort((a, b) => {
+            const areaA = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+            const areaB = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+            return areaA - areaB;
+        });
+
+        return hits[0];
+    }
+
+    /**
+     * Interactive Click Handler: Toggles isMasked between true and false.
+     */
+    handleCanvasClick(e) {
+        if (!this.originalImage || this.detections.length === 0) return;
+
+        const { x, y } = this.getCanvasCoordinates(e);
+        const hit = this.findHitDetection(x, y);
+
+        if (hit) {
+            hit.isMasked = !hit.isMasked;
+            this.updateStatusSummary();
+            this.render();
+        }
+    }
+
+    /**
+     * Mouse Move Handler: Cursor styling & subtle hover highlight.
+     */
+    handleCanvasMouseMove(e) {
+        if (!this.originalImage || this.detections.length === 0) return;
+
+        const { x, y } = this.getCanvasCoordinates(e);
+        const hit = this.findHitDetection(x, y);
+
+        if (hit) {
+            this.canvas.style.cursor = 'pointer';
+            if (this.hoveredDetectionId !== hit.id) {
+                this.hoveredDetectionId = hit.id;
+                this.render();
+            }
+        } else {
+            this.canvas.style.cursor = 'default';
+            if (this.hoveredDetectionId !== null) {
+                this.hoveredDetectionId = null;
+                this.render();
+            }
         }
     }
 
@@ -127,7 +220,7 @@ class AnonymizerStudio {
             const img = new Image();
             img.onload = () => {
                 this.originalImage = img;
-                
+
                 // Initialize canvas dimensions to exact native image resolution
                 this.canvas.width = img.naturalWidth;
                 this.canvas.height = img.naturalHeight;
@@ -172,10 +265,10 @@ class AnonymizerStudio {
 
             const data = await response.json();
             if (data.status === 'success' && Array.isArray(data.detections)) {
-                // Store detections with default active state = true
+                // Initialize detections with default isMasked = false (ready for interactive selection)
                 this.detections = data.detections.map(det => ({
                     ...det,
-                    active: true
+                    isMasked: false
                 }));
 
                 // Enable toolbar controls
@@ -184,7 +277,7 @@ class AnonymizerStudio {
                 // Update status indicator
                 this.updateStatusSummary();
 
-                // Re-render canvas with bounding boxes
+                // Re-render canvas with suggestion bounding boxes
                 this.render();
             } else {
                 throw new Error(data.message || 'پاسخ نامعتبر از سرور دریافت شد.');
@@ -227,26 +320,24 @@ class AnonymizerStudio {
     updateStatusSummary() {
         if (!this.statusBadge || !this.statusText) return;
 
-        const count = this.detections.length;
-        if (count === 0) {
+        const total = this.detections.length;
+        if (total === 0) {
             this.statusText.textContent = 'هیچ عنصر حساسی شناسایی نشد';
         } else {
-            const faces = this.detections.filter(d => d.type === 'face').length;
-            const plates = this.detections.filter(d => d.type === 'plate').length;
-            const texts = this.detections.filter(d => d.type === 'text').length;
-
-            const parts = [];
-            if (faces > 0) parts.push(`${faces} چهره`);
-            if (plates > 0) parts.push(`${plates} پلاک`);
-            if (texts > 0) parts.push(`${texts} متن`);
-
-            this.statusText.textContent = `${count} مورد حساس یافت شد (${parts.join('، ')})`;
+            const maskedCount = this.detections.filter(d => d.isMasked).length;
+            this.statusText.textContent = `${total} مورد شناسایی شد (${maskedCount} ماسک فعال)`;
         }
 
         this.statusBadge.classList.remove('hidden');
         this.statusBadge.classList.add('flex');
     }
 
+    /**
+     * Master Render Loop:
+     * 1. Draw base image
+     * 2. Apply active masks (DP-Pix for faces/plates, Solid Black for text)
+     * 3. Draw bounding boxes & labels for unmasked suggestions and masked badges
+     */
     render() {
         if (!this.originalImage) return;
 
@@ -257,13 +348,107 @@ class AnonymizerStudio {
         ctx.clearRect(0, 0, width, height);
         ctx.drawImage(this.originalImage, 0, 0, width, height);
 
-        // 2. Draw suggestion bounding boxes
+        // 2. Apply active masks
         this.detections.forEach(det => {
-            this.drawDetectionBox(ctx, det);
+            if (det.isMasked) {
+                this.applyClientMask(ctx, det);
+            }
+        });
+
+        // 3. Draw overlays (neon suggestions for unmasked, indicator badge for masked)
+        this.detections.forEach(det => {
+            const isHovered = (this.hoveredDetectionId === det.id);
+            if (det.isMasked) {
+                this.drawMaskedOverlay(ctx, det, isHovered);
+            } else {
+                this.drawSuggestionBox(ctx, det, isHovered);
+            }
         });
     }
 
-    drawDetectionBox(ctx, det) {
+    /**
+     * High-Performance Client-Side Redaction Filter Execution:
+     * - text: Solid Black Box (#000000)
+     * - face / plate: DP-Pix (Mosaic downsampling + additive Gaussian noise)
+     */
+    applyClientMask(ctx, det) {
+        let [x1, y1, x2, y2] = det.bbox;
+        x1 = Math.max(0, Math.min(x1, this.canvas.width));
+        y1 = Math.max(0, Math.min(y1, this.canvas.height));
+        x2 = Math.max(0, Math.min(x2, this.canvas.width));
+        y2 = Math.max(0, Math.min(y2, this.canvas.height));
+
+        const w = x2 - x1;
+        const h = y2 - y1;
+        if (w <= 0 || h <= 0) return;
+
+        if (det.type === 'text') {
+            // Solid Black Box (RedactionBench, 2026)
+            ctx.save();
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(x1, y1, w, h);
+            ctx.restore();
+        } else {
+            // DP-Pix: Mosaic + Noise (Incremental Anonymization, 2025)
+            try {
+                const imgData = ctx.getImageData(x1, y1, w, h);
+                const data = imgData.data;
+
+                // Dynamically scale mosaic block size to region dimensions
+                const blockSize = Math.max(8, Math.min(22, Math.round(Math.min(w, h) / 7)));
+                const noiseScale = 12.0;
+
+                for (let by = 0; by < h; by += blockSize) {
+                    for (let bx = 0; bx < w; bx += blockSize) {
+                        const bw = Math.min(blockSize, w - bx);
+                        const bh = Math.min(blockSize, h - by);
+
+                        // Average color in mosaic cell
+                        let rSum = 0, gSum = 0, bSum = 0, count = 0;
+                        for (let dy = 0; dy < bh; dy++) {
+                            for (let dx = 0; dx < bw; dx++) {
+                                const idx = ((by + dy) * w + (bx + dx)) * 4;
+                                rSum += data[idx];
+                                gSum += data[idx + 1];
+                                bSum += data[idx + 2];
+                                count++;
+                            }
+                        }
+
+                        // Additive stochastic perturbation (DP-Pix formulation)
+                        const noiseR = (Math.random() - 0.5) * 2 * noiseScale;
+                        const noiseG = (Math.random() - 0.5) * 2 * noiseScale;
+                        const noiseB = (Math.random() - 0.5) * 2 * noiseScale;
+
+                        const avgR = Math.min(255, Math.max(0, Math.round(rSum / count + noiseR)));
+                        const avgG = Math.min(255, Math.max(0, Math.round(gSum / count + noiseG)));
+                        const avgB = Math.min(255, Math.max(0, Math.round(bSum / count + noiseB)));
+
+                        // Fill block with perturbed average
+                        for (let dy = 0; dy < bh; dy++) {
+                            for (let dx = 0; dx < bw; dx++) {
+                                const idx = ((by + dy) * w + (bx + dx)) * 4;
+                                data[idx] = avgR;
+                                data[idx + 1] = avgG;
+                                data[idx + 2] = avgB;
+                            }
+                        }
+                    }
+                }
+
+                ctx.putImageData(imgData, x1, y1);
+            } catch (err) {
+                console.warn('[Anonymizer] Fallback to solid mask on canvas security limits:', err);
+                ctx.fillStyle = '#18181b';
+                ctx.fillRect(x1, y1, w, h);
+            }
+        }
+    }
+
+    /**
+     * Renders an unmasked suggestion box with neon styling and type badge.
+     */
+    drawSuggestionBox(ctx, det, isHovered) {
         const [x1, y1, x2, y2] = det.bbox;
         const boxWidth = x2 - x1;
         const boxHeight = y2 - y1;
@@ -271,34 +456,53 @@ class AnonymizerStudio {
         if (boxWidth <= 0 || boxHeight <= 0) return;
 
         const config = this.colorConfig[det.type] || this.colorConfig.default;
-        const isActive = det.active !== false;
 
         ctx.save();
 
-        if (isActive) {
-            // Neon box fill
-            ctx.fillStyle = config.fill;
-            ctx.fillRect(x1, y1, boxWidth, boxHeight);
+        // Semi-transparent neon fill
+        ctx.fillStyle = isHovered ? config.fill.replace('0.15', '0.28') : config.fill;
+        ctx.fillRect(x1, y1, boxWidth, boxHeight);
 
-            // Neon stroke
-            ctx.strokeStyle = config.stroke;
-            ctx.lineWidth = 2.5;
-            ctx.shadowColor = config.stroke;
-            ctx.shadowBlur = 6;
-            ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+        // Neon stroke border
+        ctx.strokeStyle = config.stroke;
+        ctx.lineWidth = isHovered ? 3.0 : 2.0;
+        ctx.shadowColor = config.stroke;
+        ctx.shadowBlur = isHovered ? 10 : 5;
+        ctx.strokeRect(x1, y1, boxWidth, boxHeight);
 
-            // Subtle corner accents
-            this.drawCornerAccents(ctx, x1, y1, boxWidth, boxHeight, config.stroke);
+        // Corner accents
+        this.drawCornerAccents(ctx, x1, y1, boxWidth, boxHeight, config.stroke);
 
-            // Pill label
-            this.drawBadgeLabel(ctx, x1, y1, det, config);
-        } else {
-            // Inactive / deselected state (muted dashed outline)
-            ctx.strokeStyle = 'rgba(113, 113, 122, 0.5)';
-            ctx.lineWidth = 1.5;
-            ctx.setLineDash([4, 4]);
-            ctx.strokeRect(x1, y1, boxWidth, boxHeight);
-        }
+        // Pill label
+        const scorePercent = Math.round(det.score * 100);
+        const labelText = `${config.label} ${scorePercent}%`;
+        this.drawBadgePill(ctx, x1, y1, labelText, config.badgeBg, config.badgeText, false);
+
+        ctx.restore();
+    }
+
+    /**
+     * Renders a masked area overlay (subtle border + [✓ ماسک شد] badge).
+     */
+    drawMaskedOverlay(ctx, det, isHovered) {
+        const [x1, y1, x2, y2] = det.bbox;
+        const boxWidth = x2 - x1;
+        const boxHeight = y2 - y1;
+
+        if (boxWidth <= 0 || boxHeight <= 0) return;
+
+        ctx.save();
+
+        // Clean subtle border indicating active redaction
+        ctx.strokeStyle = isHovered ? 'rgba(239, 68, 68, 0.8)' : 'rgba(16, 185, 129, 0.6)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash(isHovered ? [4, 4] : []);
+        ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+
+        // Masked status badge
+        const badgeText = isHovered ? 'کلیک جهت لغو ماسک' : '✓ ماسک‌شده';
+        const badgeBg = isHovered ? 'rgba(239, 68, 68, 0.92)' : 'rgba(16, 185, 129, 0.92)';
+        this.drawBadgePill(ctx, x1, y1, badgeText, badgeBg, '#ffffff', true);
 
         ctx.restore();
     }
@@ -341,21 +545,16 @@ class AnonymizerStudio {
         ctx.restore();
     }
 
-    drawBadgeLabel(ctx, x, y, det, config) {
-        const scorePercent = Math.round(det.score * 100);
-        const labelText = `${config.label} ${scorePercent}%`;
+    drawBadgePill(ctx, x, y, text, bgColor, textColor, isMasked) {
+        const fontSize = Math.max(12, Math.min(15, Math.round(this.canvas.width / 65)));
+        ctx.font = `600 ${fontSize}px Inter, Vazirmatn, sans-serif`;
 
-        // Responsive font size relative to image resolution
-        const fontSize = Math.max(12, Math.min(16, Math.round(this.canvas.width / 60)));
-        ctx.font = `600 ${fontSize}px Inter, sans-serif`;
-
-        const paddingX = 8;
-        const paddingY = 4;
-        const textMetrics = ctx.measureText(labelText);
+        const paddingX = 7;
+        const paddingY = 3.5;
+        const textMetrics = ctx.measureText(text);
         const badgeWidth = textMetrics.width + (paddingX * 2);
         const badgeHeight = fontSize + (paddingY * 2);
 
-        // Position label above box if space permits, else inside top
         let badgeY = y - badgeHeight - 4;
         if (badgeY < 4) {
             badgeY = y + 4;
@@ -367,17 +566,17 @@ class AnonymizerStudio {
         }
 
         // Draw pill container
-        ctx.fillStyle = config.badgeBg;
+        ctx.fillStyle = bgColor;
         ctx.shadowColor = 'rgba(0, 0, 0, 0.4)';
         ctx.shadowBlur = 4;
         this.roundRect(ctx, badgeX, badgeY, badgeWidth, badgeHeight, 4);
         ctx.fill();
 
-        // Draw pill text
-        ctx.fillStyle = config.badgeText;
+        // Draw text
+        ctx.fillStyle = textColor;
         ctx.shadowBlur = 0;
         ctx.textBaseline = 'middle';
-        ctx.fillText(labelText, badgeX + paddingX, badgeY + (badgeHeight / 2));
+        ctx.fillText(text, badgeX + paddingX, badgeY + (badgeHeight / 2));
     }
 
     roundRect(ctx, x, y, width, height, radius) {
