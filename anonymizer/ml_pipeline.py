@@ -16,8 +16,8 @@ SENSITIVE_KEYWORDS = [
     'secret', 'confidential', 'token', 'password'
 ]
 
-# Regex to detect at least 8 consecutive digits (English and Persian/Arabic)
-DIGIT_8_REGEX = re.compile(r'[\d\u0660-\u0669\u06F0-\u06F9]{8,}')
+# Regex to detect at least 8 consecutive digits (English \d{8,} and Persian [۰-۹]{8,})
+DIGIT_8_REGEX = re.compile(r'(?:\d{8,}|[۰-۹]{8,}|[\d\u06F0-\u06F9\u0660-\u0669]{8,})')
 
 # Regex for alphanumeric detection (used in cascade license plate validation)
 ALPHANUMERIC_REGEX = re.compile(r'[a-zA-Z0-9\u0600-\u06FF]')
@@ -160,6 +160,28 @@ def _load_image(image_input: Union[str, Path, np.ndarray, bytes]) -> np.ndarray:
     raise TypeError(f"Unsupported image_input type: {type(image_input)}")
 
 
+def _preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
+    """
+    Preprocesses image for EasyOCR:
+    1. Converts BGR to Grayscale via cv2.cvtColor.
+    2. Uses CLAHE and cv2.normalize to strongly boost contrast so colored text
+       (such as low-contrast green tracking numbers on white backgrounds)
+       becomes deep black and the background becomes clean white.
+    """
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Normalize contrast to full dynamic range [0, 255]
+    preprocessed = cv2.normalize(enhanced, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+    return preprocessed
+
+
 def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], conf_threshold: float = 0.40) -> Dict[str, Any]:
     """
     Analyzes an input image to detect sensitive entities:
@@ -225,7 +247,12 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
         for r in plate_results:
             boxes = r.boxes
             for box in boxes:
-                score = float(box.conf[0].item())
+                entity_type = 'plate'
+                conf = float(box.conf[0].item())
+                if entity_type == 'plate' and float(conf) < 0.60:
+                    continue
+
+                score = float(conf)
                 if score >= conf_threshold:
                     x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
                     x1_c, y1_c = clamp(x1, 0, width), clamp(y1, 0, height)
@@ -238,7 +265,7 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
                             continue
 
                         plate_ocr = ocr_reader.readtext(
-                            crop,
+                            _preprocess_for_ocr(crop),
                             adjust_contrast=True,
                             text_threshold=0.3,
                             low_text=0.3
@@ -258,11 +285,13 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
     except Exception as e:
         print(f"[ML-Pipeline] Plate detection warning: {e}")
 
-    # 3. Detect Sensitive Text with EasyOCR (Fuzzy Matching & Regex Digit Validation)
+    # 3. Detect Sensitive Text with EasyOCR (Grayscale/Contrast Preprocessing, Fuzzy Matching & Regex Digit Validation)
     try:
         ocr_reader = _model_manager.ocr_reader
+        # Preprocess image to Grayscale + CLAHE/Normalize for maximum contrast on colored text (e.g. green codes)
+        preprocessed_image = _preprocess_for_ocr(image)
         ocr_results = ocr_reader.readtext(
-            image,
+            preprocessed_image,
             adjust_contrast=True,
             text_threshold=0.3,
             low_text=0.3
@@ -273,8 +302,9 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
             if not cleaned_text:
                 continue
 
-            # 1. Regex: At least 8 consecutive digits (tracking codes, national IDs, card numbers)
-            has_8_digits = bool(DIGIT_8_REGEX.search(cleaned_text))
+            # 1. Regex: At least 8 consecutive digits (English \d{8,} or Persian [۰-۹]{8,})
+            cleaned_text_nospaces = re.sub(r'[\s\-_\/]', '', cleaned_text)
+            has_8_digits = bool(DIGIT_8_REGEX.search(cleaned_text)) or bool(DIGIT_8_REGEX.search(cleaned_text_nospaces))
 
             # 2. Fuzzy matching with sensitive keywords (> 75% partial ratio)
             is_fuzzy_sensitive = any(
