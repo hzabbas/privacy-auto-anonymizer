@@ -702,19 +702,33 @@ class AnonymizerStudio {
         leftGroup.sort((a, b) => a.boxCenterY - b.boxCenterY);
         rightGroup.sort((a, b) => a.boxCenterY - b.boxCenterY);
 
-        // 3. Smart Stacking: enforce at least 60px spacing between consecutive labels on each side
-        const minSpacing = 60;
+        // 3. Smart Stacking: enforce at least 50px spacing and strictly clamp within canvas height
+        const canvasH = rect.height;
+        const minSpacing = 50;
+        const topMargin = 25;
+        const bottomMargin = 35;
 
         [leftGroup, rightGroup].forEach(group => {
-            let lastY = 15;
+            if (group.length === 0) return;
+
+            // Downward spacing pass
+            let lastY = topMargin - minSpacing;
             group.forEach(item => {
-                let assignedY = Math.max(item.boxCenterY, 35);
+                let assignedY = Math.max(item.boxCenterY, topMargin);
                 if (assignedY < lastY + minSpacing) {
                     assignedY = lastY + minSpacing;
                 }
                 item.targetY = assignedY;
                 lastY = assignedY;
             });
+
+            // Upward clamp pass: strictly ensures bottom-most label never exceeds canvas height or overlaps controls
+            const maxBottom = canvasH - bottomMargin;
+            for (let i = group.length - 1; i >= 0; i--) {
+                const maxAllowedY = maxBottom - (group.length - 1 - i) * 36;
+                group[i].targetY = Math.min(group[i].targetY, maxAllowedY);
+                group[i].targetY = Math.max(group[i].targetY, topMargin + i * 36);
+            }
         });
 
         // Document fragments for fast atomic DOM insertion
@@ -728,26 +742,23 @@ class AnonymizerStudio {
             const isMasked = det.isMasked;
             const strokeColor = isMasked ? (isHovered ? '#ef4444' : '#10b981') : config.stroke;
 
+            // Strict Y clamping: ensure labels never exceed canvas bottom
+            const clampedY = Math.min(targetY, canvasH - 35);
+
             // Connector Geometry:
-            // p0: Anchor point on the box boundary
-            // p1: Short horizontal stub stepping outward
-            // p2: Angled diagonal dogleg leading to target Y level
-            // p3: Horizontal arm arriving at HTML label
+            // Lines extend completely outside the canvas bounds
             let p0, p1, p2, p3;
-            const stubLen = 14;
-            const doglegLen = 26;
-            const armLen = 24;
 
             if (direction === 'right') {
                 p0 = { x: sx2, y: boxCenterY };
-                p1 = { x: sx2 + stubLen, y: boxCenterY };
-                p2 = { x: sx2 + stubLen + doglegLen, y: targetY };
-                p3 = { x: sx2 + stubLen + doglegLen + armLen, y: targetY };
+                p1 = { x: sx2 + 10, y: boxCenterY };
+                p2 = { x: rect.width + 8, y: clampedY };
+                p3 = { x: rect.width + 20, y: clampedY };
             } else {
                 p0 = { x: sx1, y: boxCenterY };
-                p1 = { x: sx1 - stubLen, y: boxCenterY };
-                p2 = { x: sx1 - stubLen - doglegLen, y: targetY };
-                p3 = { x: sx1 - stubLen - doglegLen - armLen, y: targetY };
+                p1 = { x: sx1 - 10, y: boxCenterY };
+                p2 = { x: -8, y: clampedY };
+                p3 = { x: -20, y: clampedY };
             }
 
             // 1. Build SVG Connector Group
@@ -762,9 +773,9 @@ class AnonymizerStudio {
             dot0.setAttribute('fill', strokeColor);
             groupEl.appendChild(dot0);
 
-            // Polyline connecting box to callout
+            // Polyline connecting box to outer margin
             const polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
-            polyline.setAttribute('points', `${p0.x.toFixed(1)},${p0.y.toFixed(1)} ${p1.x.toFixed(1)},${p1.y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)} ${p3.x.toFixed(1)},${p3.y.toFixed(1)}`);
+            polyline.setAttribute('points', `${p0.x.toFixed(1)},${p0.y.toFixed(1)} ${p1.x.toFixed(1)},${p1.y.toFixed(1)} ${p2.x.toFixed(1)},${clampedY.toFixed(1)} ${p3.x.toFixed(1)},${clampedY.toFixed(1)}`);
             polyline.setAttribute('stroke', strokeColor);
             polyline.setAttribute('stroke-width', isHovered ? '2.2' : '1.5');
             polyline.setAttribute('stroke-linecap', 'round');
@@ -776,29 +787,30 @@ class AnonymizerStudio {
             }
             groupEl.appendChild(polyline);
 
-            // Terminal dot at label attachment
+            // Terminal dot at label attachment outside canvas
             const dot3 = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
             dot3.setAttribute('cx', p3.x.toFixed(1));
-            dot3.setAttribute('cy', p3.y.toFixed(1));
+            dot3.setAttribute('cy', clampedY.toFixed(1));
             dot3.setAttribute('r', isHovered ? '3.5' : '2.5');
             dot3.setAttribute('fill', strokeColor);
             groupEl.appendChild(dot3);
 
             svgFragment.appendChild(groupEl);
 
-            // 2. Build HTML Callout Badge
+            // 2. Build Minimal HTML Callout Badge (Strictly Outside Canvas)
             const badge = document.createElement('div');
             badge.dataset.detectionId = det.id;
 
-            // Absolute positioning precisely aligned with connector terminal
             badge.style.position = 'absolute';
-            badge.style.top = `${p3.y.toFixed(1)}px`;
+            badge.style.top = `${clampedY.toFixed(1)}px`;
+            badge.style.width = '120px';
             if (direction === 'right') {
-                badge.style.left = `${(p3.x + 4).toFixed(1)}px`;
+                badge.style.left = `${(rect.width + 20).toFixed(1)}px`;
                 badge.style.transform = 'translate(0, -50%)';
             } else {
-                badge.style.left = `${(p3.x - 4).toFixed(1)}px`;
-                badge.style.transform = 'translate(-100%, -50%)';
+                // Fixed 120px width placed strictly outside canvas with safe 20px margin (-140px to -20px)
+                badge.style.left = '-140px';
+                badge.style.transform = 'translate(0, -50%)';
             }
 
             // High-contrast HUD aesthetics
@@ -810,23 +822,17 @@ class AnonymizerStudio {
                 ? 'bg-[#141418] text-white scale-[1.04]'
                 : 'bg-[#0f0f13]/95 text-zinc-200';
 
-            const statusBadgeText = isMasked
-                ? (isHovered ? 'لغو ماسک' : '✓ ماسک‌شده')
-                : 'کلیک جهت ماسک';
-
-            const statusBadgeColor = isMasked
-                ? (isHovered ? 'text-red-400 bg-red-950/60 border-red-800/80' : 'text-emerald-400 bg-emerald-950/60 border-emerald-800/80')
-                : 'text-amber-400 bg-amber-950/50 border-amber-800/70';
-
             const scorePercent = Math.round(det.score * 100);
 
-            badge.className = `pointer-events-auto cursor-pointer select-none px-2.5 py-1.5 rounded-lg border ${borderCol} ${bgCol} text-xs font-medium transition-all duration-150 flex items-center gap-2 backdrop-blur-md whitespace-nowrap z-20 hover:scale-105 active:scale-95 group`;
+            badge.className = `pointer-events-auto cursor-pointer select-none px-2 py-1.5 rounded-lg border ${borderCol} ${bgCol} text-xs font-medium transition-all duration-150 flex items-center justify-between gap-1.5 backdrop-blur-md whitespace-nowrap z-20 hover:scale-105 active:scale-95 group`;
 
+            // Minimalist content: ONLY entity name and confidence score (no extra button text)
             badge.innerHTML = `
-                <span class="w-2.5 h-2.5 rounded-full flex-shrink-0 transition-transform duration-200 group-hover:scale-125" style="background-color: ${strokeColor}; box-shadow: 0 0 8px ${strokeColor};"></span>
-                <span class="text-zinc-100 font-medium tracking-tight">${config.label}</span>
-                <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 text-zinc-400 border border-zinc-800">${scorePercent}%</span>
-                <span class="text-[10px] font-medium px-1.5 py-0.5 rounded border ${statusBadgeColor} transition-colors">${statusBadgeText}</span>
+                <div class="flex items-center gap-1.5 overflow-hidden">
+                    <span class="w-1.5 h-1.5 rounded-full flex-shrink-0 transition-transform duration-200 group-hover:scale-125" style="background-color: ${strokeColor}; box-shadow: 0 0 6px ${strokeColor};"></span>
+                    <span class="text-zinc-100 font-medium tracking-tight text-[10px] truncate">${config.label}</span>
+                </div>
+                <span class="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-900/90 text-zinc-300 border border-zinc-700/60 flex-shrink-0">${scorePercent}%</span>
             `;
 
             // Hover interactions: highlight box, line, and badge
@@ -882,6 +888,7 @@ class AnonymizerStudio {
      * Clean Export Method:
      * Generates sanitized image directly on an off-screen canvas at native 1:1 resolution.
      * Strictly avoids rendering helper boxes, neon outlines, pills, or text labels.
+     * Robust client-side file download via dynamically created <a> element with Blob URL.
      */
     exportCleanImage() {
         if (!this.originalImage) {
@@ -908,23 +915,21 @@ class AnonymizerStudio {
             }
         });
 
-        // 3. Trigger direct client-side download via Blob URL
+        // 3. Reliable client-side download via Blob
         offCanvas.toBlob((blob) => {
-            if (!blob) {
-                alert('خطا در ایجاد فایل نهایی.');
-                return;
-            }
-
-            const url = URL.createObjectURL(blob);
+            if (!blob) return;
+            const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
-            const originalName = this.currentFile ? this.currentFile.name.replace(/\.[^/.]+$/, '') : 'document';
-            a.download = `redacted_${originalName}.png`;
+            a.style.display = 'none';
+            a.href = url;
+            a.download = `redacted_${Date.now()}.png`;
             document.body.appendChild(a);
             a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-
-            this.showToast(`تصویر پالایش‌شده با موفقیت دانلود شد: redacted_${originalName}.png`);
+            setTimeout(() => {
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+            }, 1000);
+            this.showToast('تصویر پالایش‌شده با موفقیت دانلود شد');
         }, 'image/png');
     }
 

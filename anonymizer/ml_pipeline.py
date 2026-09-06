@@ -120,7 +120,7 @@ class ModelManager:
             easyocr_storage.mkdir(parents=True, exist_ok=True)
             # verbose=False avoids Windows cp1252 charmap encoding errors with progress bar characters
             self._ocr_reader = easyocr.Reader(
-                ['en'],
+                ['fa', 'en'],
                 gpu=False,
                 model_storage_directory=str(easyocr_storage),
                 verbose=False

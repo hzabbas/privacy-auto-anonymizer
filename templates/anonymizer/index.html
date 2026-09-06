@@ -143,9 +143,9 @@
                 <input type="file" id="dropzoneFileInput" accept="image/*" class="hidden">
             </div>
 
-            <!-- Canvas HUD Container (Relative positioning for SVG Connectors & HTML Callouts) -->
-            <div id="canvasContainer" class="relative hidden max-w-full max-h-[72vh] z-10">
-                <canvas id="editor-canvas" class="block max-w-full max-h-[72vh] rounded-lg shadow-2xl object-contain"></canvas>
+            <!-- Canvas HUD Container (Standard flex container without restrictive side bounds) -->
+            <div id="canvasContainer" class="relative hidden flex items-center justify-center max-h-[70vh] w-auto my-auto">
+                <canvas id="editor-canvas" class="block max-w-full max-h-[70vh] rounded-lg shadow-2xl object-contain"></canvas>
                 <!-- SVG Connector Lines Layer -->
                 <svg id="connector-layer" class="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible"></svg>
                 <!-- HTML Callout Labels Layer -->
