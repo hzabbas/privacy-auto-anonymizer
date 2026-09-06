@@ -279,6 +279,8 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
             if not cleaned_text:
                 continue
 
+            is_sensitive = False
+
             # 1. Regex: At least 8 digits (ignoring spaces between digits)
             has_8_digits = bool(DIGIT_8_REGEX.search(cleaned_text))
 
@@ -288,26 +290,31 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
                 for kw in SENSITIVE_KEYWORDS
             )
 
-            # Accept if marked sensitive (fuzzy keyword / 8+ digits) OR general score >= conf_threshold
-            if is_fuzzy_sensitive or has_8_digits or score >= conf_threshold:
-                xs = [p[0] for p in bbox]
-                ys = [p[1] for p in bbox]
-                x1, y1 = int(min(xs)), int(min(ys))
-                x2, y2 = int(max(xs)), int(max(ys))
+            if has_8_digits or is_fuzzy_sensitive:
+                is_sensitive = True
 
-                if (x2 - x1) > 2 and (y2 - y1) > 2:
-                    detections.append({
-                        "id": current_id,
-                        "type": "text",
-                        "bbox": [
-                            clamp(x1, 0, width),
-                            clamp(y1, 0, height),
-                            clamp(x2, 0, width),
-                            clamp(y2, 0, height)
-                        ],
-                        "score": round(max(score, 0.88 if (is_fuzzy_sensitive or has_8_digits) else score), 2)
-                    })
-                    current_id += 1
+            # Strictly filter: only keep detections flagged as sensitive
+            if not is_sensitive:
+                continue
+
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x1, y1 = int(min(xs)), int(min(ys))
+            x2, y2 = int(max(xs)), int(max(ys))
+
+            if (x2 - x1) > 2 and (y2 - y1) > 2:
+                detections.append({
+                    "id": current_id,
+                    "type": "text",
+                    "bbox": [
+                        clamp(x1, 0, width),
+                        clamp(y1, 0, height),
+                        clamp(x2, 0, width),
+                        clamp(y2, 0, height)
+                    ],
+                    "score": round(max(score, 0.90), 2)
+                })
+                current_id += 1
     except Exception as e:
         print(f"[ML-Pipeline] Text OCR detection warning: {e}")
 

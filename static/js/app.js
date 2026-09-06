@@ -683,50 +683,38 @@ class AnonymizerStudio {
             const boxCenterX = (sx1 + sx2) / 2;
             const boxCenterY = (sy1 + sy2) / 2;
 
-            // Intelligent branch direction: Left or Right based on center and margin distance
-            let direction = (boxCenterX >= rect.width / 2) ? 'right' : 'left';
-            if (direction === 'right' && (rect.width - sx2 < 70) && sx1 > 90) {
-                direction = 'left';
-            } else if (direction === 'left' && sx1 < 70 && (rect.width - sx2 > 90)) {
-                direction = 'right';
-            }
-
             return {
                 det,
                 sx1, sy1, sx2, sy2,
                 boxWidth: sx2 - sx1,
                 boxHeight: sy2 - sy1,
                 boxCenterX, boxCenterY,
-                direction,
+                direction: (boxCenterX < rect.width / 2) ? 'left' : 'right',
                 targetY: boxCenterY
             };
         });
 
-        // Vertical collision avoidance: prevents callout badges on the same side from overlapping
-        ['left', 'right'].forEach(dir => {
-            const group = items.filter(it => it.direction === dir);
-            group.sort((a, b) => a.boxCenterY - b.boxCenterY);
+        // 1. Divide detections into Left and Right groups based on X coordinate (left half vs right half)
+        const leftGroup = items.filter(it => it.direction === 'left');
+        const rightGroup = items.filter(it => it.direction === 'right');
 
-            const minSpacing = 42; // Vertical badge height + breathing room
+        // 2. Sort each group from top to bottom by Y axis
+        leftGroup.sort((a, b) => a.boxCenterY - b.boxCenterY);
+        rightGroup.sort((a, b) => a.boxCenterY - b.boxCenterY);
 
-            // Downward adjustment pass
-            for (let i = 1; i < group.length; i++) {
-                if (group[i].targetY < group[i - 1].targetY + minSpacing) {
-                    group[i].targetY = group[i - 1].targetY + minSpacing;
-                }
-            }
+        // 3. Smart Stacking: enforce at least 60px spacing between consecutive labels on each side
+        const minSpacing = 60;
 
-            // Upward clamp pass so badges don't overflow the viewport boundaries
-            for (let i = group.length - 1; i >= 0; i--) {
-                const maxAllowed = Math.max(22, rect.height - 24 - (group.length - 1 - i) * minSpacing);
-                if (group[i].targetY > maxAllowed) {
-                    group[i].targetY = maxAllowed;
+        [leftGroup, rightGroup].forEach(group => {
+            let lastY = 15;
+            group.forEach(item => {
+                let assignedY = Math.max(item.boxCenterY, 35);
+                if (assignedY < lastY + minSpacing) {
+                    assignedY = lastY + minSpacing;
                 }
-                const minAllowed = 22 + i * minSpacing;
-                if (group[i].targetY < minAllowed) {
-                    group[i].targetY = minAllowed;
-                }
-            }
+                item.targetY = assignedY;
+                lastY = assignedY;
+            });
         });
 
         // Document fragments for fast atomic DOM insertion
