@@ -201,6 +201,14 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
                 score = float(box.conf[0].item())
                 if score >= conf_threshold:
                     x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                    w = x2 - x1
+                    h = y2 - y1
+                    if w > 10 and h > 10:
+                        x1 += int(w * 0.05)
+                        x2 -= int(w * 0.05)
+                        y1 += int(h * 0.05)
+                        y2 -= int(h * 0.05)
+
                     detections.append({
                         "id": current_id,
                         "type": "face",
@@ -246,7 +254,9 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
                             crop,
                             adjust_contrast=True,
                             text_threshold=0.3,
-                            low_text=0.3
+                            low_text=0.3,
+                            width_ths=0.2,
+                            add_margin=0.0
                         )
                         plate_text = "".join([str(item[1]) for item in plate_ocr])
                         if not ALPHANUMERIC_REGEX.search(plate_text):
@@ -272,7 +282,9 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
             text_threshold=0.3,
             low_text=0.3,
             canvas_size=1920,
-            mag_ratio=1.0
+            mag_ratio=1.0,
+            width_ths=0.2,
+            add_margin=0.0
         )
         for bbox, text, score in ocr_results:
             score = float(score)
@@ -303,6 +315,14 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
             ys = [p[1] for p in bbox]
             x1, y1 = int(min(xs)), int(min(ys))
             x2, y2 = int(max(xs)), int(max(ys))
+
+            w = x2 - x1
+            h = y2 - y1
+            if w > 10 and h > 10:
+                x1 += int(w * 0.02)
+                x2 -= int(w * 0.02)
+                y1 += int(h * 0.12)  # جمع کردن حاشیه‌های بالا و پایین
+                y2 -= int(h * 0.12)
 
             if (x2 - x1) > 2 and (y2 - y1) > 2:
                 detections.append({
