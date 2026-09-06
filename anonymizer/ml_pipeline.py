@@ -5,8 +5,22 @@ from pathlib import Path
 from typing import Union, Dict, Any, List
 import numpy as np
 import cv2
+import re
 import warnings
 warnings.filterwarnings("ignore")
+from thefuzz import fuzz
+
+# Sensitive keywords for fuzzy string matching (threshold > 75%)
+SENSITIVE_KEYWORDS = [
+    'کد', 'ملی', 'رهگیری', 'شناسه', 'شبا', 'کارت', 'رمز', 'تلفن', 'شماره',
+    'secret', 'confidential', 'token', 'password'
+]
+
+# Regex to detect at least 8 consecutive digits (English and Persian/Arabic)
+DIGIT_8_REGEX = re.compile(r'[\d\u0660-\u0669\u06F0-\u06F9]{8,}')
+
+# Regex for alphanumeric detection (used in cascade license plate validation)
+ALPHANUMERIC_REGEX = re.compile(r'[a-zA-Z0-9\u0600-\u06FF]')
 
 # Ensure UTF-8 output encoding across Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -202,38 +216,74 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
     except Exception as e:
         print(f"[ML-Pipeline] Face detection warning: {e}")
 
-    # 2. Detect License Plates
+    # 2. Detect License Plates with Cascade Validation
     try:
         plate_model = _model_manager.plate_model
         plate_results = plate_model.predict(source=image, conf=conf_threshold, verbose=False)
+        ocr_reader = _model_manager.ocr_reader
+
         for r in plate_results:
             boxes = r.boxes
             for box in boxes:
                 score = float(box.conf[0].item())
                 if score >= conf_threshold:
                     x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                    x1_c, y1_c = clamp(x1, 0, width), clamp(y1, 0, height)
+                    x2_c, y2_c = clamp(x2, 0, width), clamp(y2, 0, height)
+
+                    # Cascade Validation: If confidence < 0.70, verify with OCR to drop false positives
+                    if score < 0.70:
+                        crop = image[y1_c:y2_c, x1_c:x2_c]
+                        if crop.size == 0 or crop.shape[0] < 4 or crop.shape[1] < 4:
+                            continue
+
+                        plate_ocr = ocr_reader.readtext(
+                            crop,
+                            adjust_contrast=True,
+                            text_threshold=0.3,
+                            low_text=0.3
+                        )
+                        plate_text = "".join([str(item[1]) for item in plate_ocr])
+                        if not ALPHANUMERIC_REGEX.search(plate_text):
+                            # Drop false positive (no alphanumeric content detected in crop)
+                            continue
+
                     detections.append({
                         "id": current_id,
                         "type": "plate",
-                        "bbox": [
-                            clamp(x1, 0, width),
-                            clamp(y1, 0, height),
-                            clamp(x2, 0, width),
-                            clamp(y2, 0, height)
-                        ],
+                        "bbox": [x1_c, y1_c, x2_c, y2_c],
                         "score": round(score, 2)
                     })
                     current_id += 1
     except Exception as e:
         print(f"[ML-Pipeline] Plate detection warning: {e}")
 
-    # 3. Detect Text with EasyOCR
+    # 3. Detect Sensitive Text with EasyOCR (Fuzzy Matching & Regex Digit Validation)
     try:
         ocr_reader = _model_manager.ocr_reader
-        ocr_results = ocr_reader.readtext(image)
+        ocr_results = ocr_reader.readtext(
+            image,
+            adjust_contrast=True,
+            text_threshold=0.3,
+            low_text=0.3
+        )
         for bbox, text, score in ocr_results:
             score = float(score)
-            if score >= conf_threshold:
+            cleaned_text = str(text).strip()
+            if not cleaned_text:
+                continue
+
+            # 1. Regex: At least 8 consecutive digits (tracking codes, national IDs, card numbers)
+            has_8_digits = bool(DIGIT_8_REGEX.search(cleaned_text))
+
+            # 2. Fuzzy matching with sensitive keywords (> 75% partial ratio)
+            is_fuzzy_sensitive = any(
+                fuzz.partial_ratio(kw, cleaned_text) > 75
+                for kw in SENSITIVE_KEYWORDS
+            )
+
+            # Accept if marked sensitive (fuzzy keyword / 8+ digits) OR general score >= conf_threshold
+            if is_fuzzy_sensitive or has_8_digits or score >= conf_threshold:
                 xs = [p[0] for p in bbox]
                 ys = [p[1] for p in bbox]
                 x1, y1 = int(min(xs)), int(min(ys))
@@ -249,7 +299,7 @@ def analyze_image_entities(image_input: Union[str, Path, np.ndarray, bytes], con
                             clamp(x2, 0, width),
                             clamp(y2, 0, height)
                         ],
-                        "score": round(score, 2)
+                        "score": round(max(score, 0.88 if (is_fuzzy_sensitive or has_8_digits) else score), 2)
                     })
                     current_id += 1
     except Exception as e:
@@ -270,10 +320,11 @@ if __name__ == "__main__":
 
     print("--- Running ML Pipeline Self-Test ---")
 
-    # Create a test image with text
+    # Create a test image with sensitive text and tracking numbers
     test_img = np.full((500, 700, 3), 255, dtype=np.uint8)
-    cv2.putText(test_img, "CONFIDENTIAL REPORT 2026", (60, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3)
-    cv2.putText(test_img, "SECURITY TOKEN: 99482", (60, 280), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (10, 10, 10), 2)
+    cv2.putText(test_img, "CONFIDENTIAL REPORT 2026", (60, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 2)
+    cv2.putText(test_img, "TRACKING NO: 994827150", (60, 250), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (10, 10, 10), 2)
+    cv2.putText(test_img, "SECURITY TOKEN 88219473", (60, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20, 120, 20), 2)
 
     print("Executing analyze_image_entities on test frame...")
     results = analyze_image_entities(test_img, conf_threshold=0.30)

@@ -41,35 +41,35 @@ class AnonymizerStudio {
         this.hoveredDetectionId = null;
         this.isComparing = false; // When true, renders raw unmasked original image
 
-        // Color themes for entities
+        // Color themes for entities (English labels avoid Canvas RTL character disjointing)
         this.colorConfig = {
             face: {
                 stroke: '#06b6d4',      // Neon Cyan
                 fill: 'rgba(6, 182, 212, 0.15)',
-                badgeBg: 'rgba(6, 182, 212, 0.95)',
+                badgeBg: '#06b6d4',     // Solid 100% opacity to prevent text bleed-through
                 badgeText: '#ffffff',
-                label: 'چهره (Face)'
+                label: 'Face'
             },
             plate: {
                 stroke: '#10b981',     // Neon Emerald
                 fill: 'rgba(16, 185, 129, 0.15)',
-                badgeBg: 'rgba(16, 185, 129, 0.95)',
+                badgeBg: '#10b981',    // Solid 100% opacity
                 badgeText: '#ffffff',
-                label: 'پلاک (Plate)'
+                label: 'Plate'
             },
             text: {
                 stroke: '#f59e0b',      // Neon Amber
                 fill: 'rgba(245, 158, 11, 0.15)',
-                badgeBg: 'rgba(245, 158, 11, 0.95)',
+                badgeBg: '#f59e0b',     // Solid 100% opacity
                 badgeText: '#ffffff',
-                label: 'متن (Text)'
+                label: 'Sensitive Text'
             },
             default: {
                 stroke: '#8b5cf6',
                 fill: 'rgba(139, 92, 246, 0.15)',
-                badgeBg: 'rgba(139, 92, 246, 0.95)',
+                badgeBg: '#8b5cf6',
                 badgeText: '#ffffff',
-                label: 'عنصر حساس'
+                label: 'Sensitive Entity'
             }
         };
 
@@ -602,9 +602,9 @@ class AnonymizerStudio {
         ctx.setLineDash(isHovered ? [4, 4] : []);
         ctx.strokeRect(x1, y1, boxWidth, boxHeight);
 
-        // Masked status badge
-        const badgeText = isHovered ? 'کلیک جهت لغو ماسک' : '✓ ماسک‌شده';
-        const badgeBg = isHovered ? 'rgba(239, 68, 68, 0.92)' : 'rgba(16, 185, 129, 0.92)';
+        // Masked status badge in clean English
+        const badgeText = isHovered ? 'Click to Unmask' : '✓ Masked';
+        const badgeBg = isHovered ? '#ef4444' : '#10b981';
         this.drawBadgePill(ctx, x1, y1, badgeText, badgeBg, '#ffffff', true);
 
         ctx.restore();
@@ -650,10 +650,10 @@ class AnonymizerStudio {
 
     drawBadgePill(ctx, x, y, text, bgColor, textColor, isMasked) {
         const fontSize = Math.max(12, Math.min(15, Math.round(this.canvas.width / 65)));
-        ctx.font = `600 ${fontSize}px Inter, Vazirmatn, sans-serif`;
+        ctx.font = `600 ${fontSize}px Inter, -apple-system, sans-serif`;
 
-        const paddingX = 7;
-        const paddingY = 3.5;
+        const paddingX = 8;
+        const paddingY = 4;
         const textMetrics = ctx.measureText(text);
         const badgeWidth = textMetrics.width + (paddingX * 2);
         const badgeHeight = fontSize + (paddingY * 2);
@@ -668,18 +668,21 @@ class AnonymizerStudio {
             badgeX = this.canvas.width - badgeWidth - 4;
         }
 
-        // Draw pill container
+        ctx.save();
+        // Fully solid background (Opacity = 1.0) to eliminate text bleed-through
+        ctx.globalAlpha = 1.0;
         ctx.fillStyle = bgColor;
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.4)';
-        ctx.shadowBlur = 4;
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.6)';
+        ctx.shadowBlur = 6;
         this.roundRect(ctx, badgeX, badgeY, badgeWidth, badgeHeight, 4);
         ctx.fill();
 
-        // Draw text
+        // Draw crisp text
         ctx.fillStyle = textColor;
         ctx.shadowBlur = 0;
         ctx.textBaseline = 'middle';
         ctx.fillText(text, badgeX + paddingX, badgeY + (badgeHeight / 2));
+        ctx.restore();
     }
 
     roundRect(ctx, x, y, width, height, radius) {
