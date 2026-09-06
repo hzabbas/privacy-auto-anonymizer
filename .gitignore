@@ -40,6 +40,7 @@ staticfiles/
 *.engine
 *.tflite
 *.weights
+weights/
 runs/
 .easyocr/
 models/*.pt
