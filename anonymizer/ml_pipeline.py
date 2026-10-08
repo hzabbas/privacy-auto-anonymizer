@@ -167,7 +167,7 @@ class ModelManager:
                 if self._paddle_ocr_reader is None:
                     try:
                         from paddleocr import PaddleOCR
-                        self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+                        self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
                         print("[ML-Pipeline] Loaded PaddleOCR.")
                     except ImportError:
                         raise ValueError("مدل PaddleOCR روی سرور نصب نیست. لطفاً آن را نصب کنید.")
@@ -494,10 +494,26 @@ def preprocess_for_ocr(img_bgr: np.ndarray):
     return gray, blackhat_inv, y_offset, M_inv
 
 
-def _run_easyocr_pipeline(image: np.ndarray, width: int, height: int) -> List[Dict[str, Any]]:
+def _run_easyocr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
     ocr_reader = _model_manager.ocr_reader
     longest = max(width, height)
     mag_ratio = 1.5 if longest < 1280 else 1.0
+    
+    if is_crop:
+        ocr_results = ocr_reader.readtext(
+            image,
+            detail=1,
+            paragraph=False,
+            canvas_size=2560,
+            mag_ratio=mag_ratio,
+            text_threshold=0.5,
+            low_text=0.35,
+            link_threshold=0.4,
+            width_ths=0.5,
+            add_margin=0.05,
+        )
+        return _ocr_pii_detections(ocr_results, width, height)
+        
     ocr_image, mrz_crop, y_offset, M_inv = preprocess_for_ocr(image)
     
     ocr_results = ocr_reader.readtext(
@@ -533,37 +549,77 @@ def _run_easyocr_pipeline(image: np.ndarray, width: int, height: int) -> List[Di
     return _ocr_pii_detections(ocr_results, width, height, M_inv)
 
 
-def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int) -> List[Dict[str, Any]]:
+def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
     paddle = _model_manager.paddle_ocr_reader
+    
+    if is_crop:
+        results = paddle.ocr(image, cls=True)
+        ocr_results = []
+        if results and results[0]:
+            for line in results[0]:
+                bbox, (text, conf) = line
+                ocr_results.append((bbox, text, conf))
+        return _ocr_pii_detections(ocr_results, width, height)
+        
     ocr_image, mrz_crop, y_offset, M_inv = preprocess_for_ocr(image)
+    
+    # Run on main image
     results = paddle.ocr(ocr_image, cls=True)
     ocr_results = []
     if results and results[0]:
         for line in results[0]:
             bbox, (text, conf) = line
             ocr_results.append((bbox, text, conf))
+            
+    # Run on MRZ crop if available
+    if mrz_crop is not None and mrz_crop.size > 0:
+        mrz_results = paddle.ocr(mrz_crop, cls=True)
+        if mrz_results and mrz_results[0]:
+            for line in mrz_results[0]:
+                bbox, (text, conf) = line
+                shifted_bbox = [[p[0], p[1] + y_offset] for p in bbox]
+                ocr_results.append((shifted_bbox, text, conf))
+                
     return _ocr_pii_detections(ocr_results, width, height, M_inv)
 
 
-def _run_doctr_pipeline(image: np.ndarray, width: int, height: int) -> List[Dict[str, Any]]:
+def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
     doctr = _model_manager.doctr_reader
-    # Basic implementation since doctr expects different image formats
-    # For now, we will extract text using doctr prediction
     from doctr.io import DocumentFile
-    doc = DocumentFile.from_images([image])
-    result = doctr(doc)
-    ocr_results = []
-    for page in result.pages:
-        for block in page.blocks:
-            for line in block.lines:
-                text = " ".join(word.value for word in line.words)
-                conf = sum(word.confidence for word in line.words) / len(line.words)
-                # doctr bbox is (xmin, ymin, xmax, ymax) in relative coords (0-1)
-                xmin, ymin = line.geometry[0]
-                xmax, ymax = line.geometry[1]
-                bbox = [[xmin*width, ymin*height], [xmax*width, ymin*height], [xmax*width, ymax*height], [xmin*width, ymax*height]]
-                ocr_results.append((bbox, text, conf))
-    return _ocr_pii_detections(ocr_results, width, height)
+    
+    def _run_doctr_on_img(img_array):
+        rgb_img = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+        doc = DocumentFile.from_images([rgb_img])
+        result = doctr(doc)
+        res_list = []
+        img_h, img_w = img_array.shape[:2]
+        for page in result.pages:
+            for block in page.blocks:
+                for line in block.lines:
+                    text = " ".join(word.value for word in line.words)
+                    if not text.strip(): continue
+                    conf = sum(word.confidence for word in line.words) / len(line.words)
+                    xmin, ymin = line.geometry[0]
+                    xmax, ymax = line.geometry[1]
+                    bbox = [[xmin*img_w, ymin*img_h], [xmax*img_w, ymin*img_h], [xmax*img_w, ymax*img_h], [xmin*img_w, ymax*img_h]]
+                    res_list.append((bbox, text, conf))
+        return res_list
+        
+    if is_crop:
+        ocr_results = _run_doctr_on_img(image)
+        return _ocr_pii_detections(ocr_results, width, height)
+    
+    ocr_image, mrz_crop, y_offset, M_inv = preprocess_for_ocr(image)
+    
+    ocr_results = _run_doctr_on_img(ocr_image)
+    
+    if mrz_crop is not None and mrz_crop.size > 0:
+        mrz_results = _run_doctr_on_img(mrz_crop)
+        for bbox, text, conf in mrz_results:
+            shifted_bbox = [[p[0], p[1] + y_offset] for p in bbox]
+            ocr_results.append((shifted_bbox, text, conf))
+
+    return _ocr_pii_detections(ocr_results, width, height, M_inv)
 
 
 def analyze_image_entities(
@@ -676,11 +732,11 @@ def analyze_image_entities(
                     crop_h, crop_w = crop.shape[:2]
                     
                     if ocr_engine == 'paddleocr':
-                        block_dets = _run_paddleocr_pipeline(crop, crop_w, crop_h)
+                        block_dets = _run_paddleocr_pipeline(crop, crop_w, crop_h, is_crop=True)
                     elif ocr_engine == 'doctr':
-                        block_dets = _run_doctr_pipeline(crop, crop_w, crop_h)
+                        block_dets = _run_doctr_pipeline(crop, crop_w, crop_h, is_crop=True)
                     else:
-                        block_dets = _run_easyocr_pipeline(crop, crop_w, crop_h)
+                        block_dets = _run_easyocr_pipeline(crop, crop_w, crop_h, is_crop=True)
                         
                     # Shift coordinates back to original image
                     for det in block_dets:

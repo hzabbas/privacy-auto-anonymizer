@@ -487,11 +487,21 @@ class AnonymizerStudio {
         if (!this.statusBadge || !this.statusText) return;
 
         const total = this.detections.length;
+        const dot = this.statusBadge.querySelector('span.w-2');
+        
         if (total === 0) {
-            this.statusText.textContent = 'هیچ عنصر حساسی شناسایی نشد';
+            this.statusText.textContent = 'هیچ عنصر حساسی یافت نشد';
+            if (dot) {
+                dot.classList.remove('bg-emerald-500');
+                dot.classList.add('bg-amber-500');
+            }
         } else {
             const maskedCount = this.detections.filter(d => d.isMasked).length;
             this.statusText.textContent = `${total} مورد شناسایی شد (${maskedCount} ماسک فعال)`;
+            if (dot) {
+                dot.classList.remove('bg-amber-500');
+                dot.classList.add('bg-emerald-500');
+            }
         }
 
         this.statusBadge.classList.remove('hidden');
