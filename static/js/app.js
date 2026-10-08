@@ -349,6 +349,11 @@ class AnonymizerStudio {
     }
 
     async analyzeImage(file) {
+        if (this.isProcessing) {
+            console.warn("[Anonymizer] Already processing an image. Please wait.");
+            return;
+        }
+        
         this.setLoading(true);
         if (this.statusBadge) this.statusBadge.classList.add('hidden');
 
@@ -429,12 +434,37 @@ class AnonymizerStudio {
     setLoading(loading) {
         this.isProcessing = loading;
         if (this.loadingOverlay) {
+            const textElement = this.loadingOverlay.querySelector('p');
+            
             if (loading) {
                 this.loadingOverlay.classList.remove('hidden');
                 this.loadingOverlay.classList.add('flex');
+                
+                if (textElement) {
+                    textElement.style.transition = 'opacity 0.3s ease';
+                    textElement.style.opacity = '1';
+                    textElement.textContent = "در حال پردازش تصاویر...";
+                    
+                    if (this.loadingTimeout) clearTimeout(this.loadingTimeout);
+                    
+                    this.loadingTimeout = setTimeout(() => {
+                        if (this.isProcessing) {
+                            textElement.style.opacity = '0';
+                            setTimeout(() => {
+                                textElement.textContent = "در حال بارگذاری یا دانلود مدل‌های هوشمند (در اولین اجرا ممکن است چند دقیقه زمان ببرد)...";
+                                textElement.style.opacity = '1';
+                            }, 300);
+                        }
+                    }, 6000);
+                }
             } else {
                 this.loadingOverlay.classList.remove('flex');
                 this.loadingOverlay.classList.add('hidden');
+                
+                if (this.loadingTimeout) {
+                    clearTimeout(this.loadingTimeout);
+                    this.loadingTimeout = null;
+                }
             }
         }
     }
