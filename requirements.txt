@@ -3,5 +3,14 @@ ultralytics>=8.0.0
 easyocr>=1.7.0
 opencv-python>=4.8.0
 numpy>=1.24.0
-thefuzz>=0.22.0
-python-Levenshtein>=0.27.0
+
+# Optional (improve PII recall; the pipeline works without them):
+#   phonenumbers  - Google libphonenumber validation for international phone numbers
+#   transformers  - BERT NER (dslim/bert-base-NER) for person / location names
+phonenumbers>=8.13
+transformers>=4.40
+paddleocr>=2.7.0
+paddlepaddle>=2.6.0
+python-doctr>=0.8.1
+tf2onnx>=1.16.1
+layoutparser>=0.3.4

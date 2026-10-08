@@ -167,10 +167,11 @@ class ModelManager:
                 if self._paddle_ocr_reader is None:
                     try:
                         from paddleocr import PaddleOCR
-                        self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
-                        print("[ML-Pipeline] Loaded PaddleOCR.")
+                        self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='fa')
+                        print("[ML-Pipeline] Loaded PaddleOCR (Persian/English).")
                     except ImportError:
-                        raise ValueError("مدل PaddleOCR روی سرور نصب نیست. لطفاً آن را نصب کنید.")
+                        print("[ML-Pipeline] Warning: PaddleOCR not installed.")
+                        self._paddle_ocr_reader = None
         return self._paddle_ocr_reader
 
     @property
@@ -183,9 +184,10 @@ class ModelManager:
                     try:
                         from doctr.models import ocr_predictor
                         self._doctr_reader = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
-                        print("[ML-Pipeline] Loaded DocTR.")
+                        print("[ML-Pipeline] Loaded DocTR. Note: Standard DocTR weights are Latin-only. Persian/Arabic text may not be recognized.")
                     except ImportError:
-                        raise ValueError("مدل DocTR روی سرور نصب نیست. لطفاً آن را نصب کنید.")
+                        print("[ML-Pipeline] Warning: DocTR not installed.")
+                        self._doctr_reader = None
         return self._doctr_reader
         
     @property
@@ -200,7 +202,8 @@ class ModelManager:
                         self._layout_parser = lp.Detectron2LayoutModel('lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config', extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5])
                         print("[ML-Pipeline] Loaded LayoutParser.")
                     except ImportError:
-                        raise ValueError("مدل LayoutParser روی سرور نصب نیست. لطفاً آن را نصب کنید.")
+                        print("[ML-Pipeline] Warning: LayoutParser not installed.")
+                        self._layout_parser = None
         return self._layout_parser
 
 # Global singleton instance
@@ -551,6 +554,9 @@ def _run_easyocr_pipeline(image: np.ndarray, width: int, height: int, is_crop: b
 
 def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
     paddle = _model_manager.paddle_ocr_reader
+    if paddle is None:
+        print("[ML-Pipeline] PaddleOCR unavailable, falling back to EasyOCR.")
+        return _run_easyocr_pipeline(image, width, height, is_crop)
     
     if is_crop:
         results = paddle.ocr(image, cls=True)
@@ -585,6 +591,10 @@ def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int, is_crop:
 
 def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
     doctr = _model_manager.doctr_reader
+    if doctr is None:
+        print("[ML-Pipeline] DocTR unavailable, falling back to EasyOCR.")
+        return _run_easyocr_pipeline(image, width, height, is_crop)
+        
     from doctr.io import DocumentFile
     
     def _run_doctr_on_img(img_array):
@@ -720,12 +730,16 @@ def analyze_image_entities(
         lp_blocks = []
         if layout_engine == 'layoutparser':
             lp_model = _model_manager.layout_parser
-            layout = lp_model.detect(image)
-            # Filter for Text blocks
-            for block in layout:
-                if block.type in ["Text", "Title", "List"]:
-                    x1, y1, x2, y2 = block.coordinates
-                    lp_blocks.append([int(x1), int(y1), int(x2), int(y2)])
+            if lp_model is None:
+                print("[ML-Pipeline] LayoutParser not available, falling back to regex.")
+                layout_engine = 'regex'
+            else:
+                layout = lp_model.detect(image)
+                # Filter for Text blocks
+                for block in layout:
+                    if block.type in ["Text", "Title", "List"]:
+                        x1, y1, x2, y2 = block.coordinates
+                        lp_blocks.append([int(x1), int(y1), int(x2), int(y2)])
 
         text_dets = []
         if layout_engine == 'layoutparser' and lp_blocks:
