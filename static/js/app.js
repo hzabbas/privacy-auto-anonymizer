@@ -71,6 +71,12 @@ class AnonymizerStudio {
         this.initEventListeners();
     }
 
+    escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, (c) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+
     initEventListeners() {
         // File inputs (header and dropzone)
         this.uploadInputs.forEach(input => {
@@ -214,10 +220,28 @@ class AnonymizerStudio {
     /**
      * Hit testing: Finds detections overlapping coordinates, prioritizing smaller areas.
      */
+    isPointInPolygon(point, polygon) {
+        let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+            const xi = polygon[i][0], yi = polygon[i][1];
+            const xj = polygon[j][0], yj = polygon[j][1];
+            const intersect = ((yi > point.y) !== (yj > point.y)) &&
+                (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi);
+            if (intersect) inside = !inside;
+        }
+        return inside;
+    }
+
+    /**
+     * Hit testing: Finds detections overlapping coordinates, prioritizing smaller areas.
+     */
     findHitDetection(x, y) {
         if (this.isComparing) return null;
 
         const hits = this.detections.filter(det => {
+            if (det.polygon && Array.isArray(det.polygon) && det.polygon.length >= 3) {
+                return this.isPointInPolygon({ x, y }, det.polygon);
+            }
             const [x1, y1, x2, y2] = det.bbox;
             return x >= x1 && x <= x2 && y >= y1 && y <= y2;
         });
@@ -321,6 +345,11 @@ class AnonymizerStudio {
             const formData = new FormData();
             formData.append('image', file);
             formData.append('conf_threshold', '0.35');
+            
+            const ocrEngine = document.getElementById('ocrEngineSelect')?.value || 'easyocr';
+            const layoutEngine = document.getElementById('layoutEngineSelect')?.value || 'regex';
+            formData.append('ocr_engine', ocrEngine);
+            formData.append('layout_engine', layoutEngine);
 
             const response = await fetch('/api/analyze/', {
                 method: 'POST',
@@ -478,7 +507,7 @@ class AnonymizerStudio {
 
     /**
      * High-Performance Client-Side Redaction Filter Execution:
-     * - text: Solid Black Box (#000000)
+     * - text: Solid Black Mask (#000000) adhering strictly to tilted / oriented polygon
      * - face / plate: DP-Pix (Mosaic downsampling + additive Gaussian/Laplace noise)
      */
     applyClientMask(ctx, det, canvasW, canvasH) {
@@ -493,14 +522,35 @@ class AnonymizerStudio {
         if (w <= 0 || h <= 0) return;
 
         if (det.type === 'text') {
-            // Solid Black Box (RedactionBench, 2026)
+            // Solid Black Mask adhering strictly to the tilted/oriented polygon
             ctx.save();
             ctx.fillStyle = '#000000';
-            ctx.fillRect(x1, y1, w, h);
+            if (det.polygon && Array.isArray(det.polygon) && det.polygon.length >= 3) {
+                ctx.beginPath();
+                ctx.moveTo(det.polygon[0][0], det.polygon[0][1]);
+                for (let i = 1; i < det.polygon.length; i++) {
+                    ctx.lineTo(det.polygon[i][0], det.polygon[i][1]);
+                }
+                ctx.closePath();
+                ctx.fill();
+            } else {
+                ctx.fillRect(x1, y1, w, h);
+            }
             ctx.restore();
         } else {
             // DP-Pix: Mosaic + Noise (Incremental Anonymization, 2025)
             try {
+                ctx.save();
+                if (det.polygon && Array.isArray(det.polygon) && det.polygon.length >= 3) {
+                    ctx.beginPath();
+                    ctx.moveTo(det.polygon[0][0], det.polygon[0][1]);
+                    for (let i = 1; i < det.polygon.length; i++) {
+                        ctx.lineTo(det.polygon[i][0], det.polygon[i][1]);
+                    }
+                    ctx.closePath();
+                    ctx.clip();
+                }
+
                 const imgData = ctx.getImageData(x1, y1, w, h);
                 const data = imgData.data;
 
@@ -547,41 +597,65 @@ class AnonymizerStudio {
                 }
 
                 ctx.putImageData(imgData, x1, y1);
+                ctx.restore();
             } catch (err) {
                 console.warn('[Anonymizer] Fallback to solid mask on canvas limits:', err);
                 ctx.fillStyle = '#18181b';
                 ctx.fillRect(x1, y1, w, h);
+                ctx.restore();
             }
         }
     }
 
     /**
-     * Renders an unmasked suggestion box with neon styling (strokes and corners only).
+     * Renders an unmasked suggestion box with neon styling (tilted polygon or box).
      */
     drawSuggestionBox(ctx, det, isHovered) {
-        const [x1, y1, x2, y2] = det.bbox;
-        const boxWidth = x2 - x1;
-        const boxHeight = y2 - y1;
-
-        if (boxWidth <= 0 || boxHeight <= 0) return;
-
         const config = this.colorConfig[det.type] || this.colorConfig.default;
-
         ctx.save();
 
-        // Semi-transparent neon fill
-        ctx.fillStyle = isHovered ? config.fill.replace('0.15', '0.28') : config.fill;
-        ctx.fillRect(x1, y1, boxWidth, boxHeight);
+        if (det.polygon && Array.isArray(det.polygon) && det.polygon.length >= 3) {
+            ctx.beginPath();
+            ctx.moveTo(det.polygon[0][0], det.polygon[0][1]);
+            for (let i = 1; i < det.polygon.length; i++) {
+                ctx.lineTo(det.polygon[i][0], det.polygon[i][1]);
+            }
+            ctx.closePath();
 
-        // Neon stroke border
-        ctx.strokeStyle = config.stroke;
-        ctx.lineWidth = isHovered ? 3.0 : 2.0;
-        ctx.shadowColor = config.stroke;
-        ctx.shadowBlur = isHovered ? 10 : 5;
-        ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+            // Semi-transparent neon fill
+            ctx.fillStyle = isHovered ? config.fill.replace('0.15', '0.28') : config.fill;
+            ctx.fill();
 
-        // Corner accents
-        this.drawCornerAccents(ctx, x1, y1, boxWidth, boxHeight, config.stroke);
+            // Neon stroke border along tilted polygon
+            ctx.strokeStyle = config.stroke;
+            ctx.lineWidth = isHovered ? 3.0 : 2.0;
+            ctx.shadowColor = config.stroke;
+            ctx.shadowBlur = isHovered ? 10 : 5;
+            ctx.stroke();
+        } else {
+            const [x1, y1, x2, y2] = det.bbox;
+            const boxWidth = x2 - x1;
+            const boxHeight = y2 - y1;
+
+            if (boxWidth <= 0 || boxHeight <= 0) {
+                ctx.restore();
+                return;
+            }
+
+            // Semi-transparent neon fill
+            ctx.fillStyle = isHovered ? config.fill.replace('0.15', '0.28') : config.fill;
+            ctx.fillRect(x1, y1, boxWidth, boxHeight);
+
+            // Neon stroke border
+            ctx.strokeStyle = config.stroke;
+            ctx.lineWidth = isHovered ? 3.0 : 2.0;
+            ctx.shadowColor = config.stroke;
+            ctx.shadowBlur = isHovered ? 10 : 5;
+            ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+
+            // Corner accents
+            this.drawCornerAccents(ctx, x1, y1, boxWidth, boxHeight, config.stroke);
+        }
 
         ctx.restore();
     }
@@ -590,19 +664,32 @@ class AnonymizerStudio {
      * Renders a masked area overlay (subtle border without canvas text).
      */
     drawMaskedOverlay(ctx, det, isHovered) {
-        const [x1, y1, x2, y2] = det.bbox;
-        const boxWidth = x2 - x1;
-        const boxHeight = y2 - y1;
-
-        if (boxWidth <= 0 || boxHeight <= 0) return;
-
         ctx.save();
 
         // Clean subtle border indicating active redaction
         ctx.strokeStyle = isHovered ? 'rgba(239, 68, 68, 0.9)' : 'rgba(16, 185, 129, 0.7)';
         ctx.lineWidth = 1.5;
         ctx.setLineDash(isHovered ? [4, 4] : []);
-        ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+
+        if (det.polygon && Array.isArray(det.polygon) && det.polygon.length >= 3) {
+            ctx.beginPath();
+            ctx.moveTo(det.polygon[0][0], det.polygon[0][1]);
+            for (let i = 1; i < det.polygon.length; i++) {
+                ctx.lineTo(det.polygon[i][0], det.polygon[i][1]);
+            }
+            ctx.closePath();
+            ctx.stroke();
+        } else {
+            const [x1, y1, x2, y2] = det.bbox;
+            const boxWidth = x2 - x1;
+            const boxHeight = y2 - y1;
+
+            if (boxWidth <= 0 || boxHeight <= 0) {
+                ctx.restore();
+                return;
+            }
+            ctx.strokeRect(x1, y1, boxWidth, boxHeight);
+        }
 
         ctx.restore();
     }
@@ -830,7 +917,7 @@ class AnonymizerStudio {
             badge.innerHTML = `
                 <div class="flex items-center gap-1.5 overflow-hidden">
                     <span class="w-1.5 h-1.5 rounded-full flex-shrink-0 transition-transform duration-200 group-hover:scale-125" style="background-color: ${strokeColor}; box-shadow: 0 0 6px ${strokeColor};"></span>
-                    <span class="text-zinc-100 font-medium tracking-tight text-[10px] truncate">${config.label}</span>
+                    <span class="text-zinc-100 font-medium tracking-tight text-[10px] truncate">${this.escapeHtml(det.label ? `متن حساس: ${det.label}` : config.label)}</span>
                 </div>
                 <span class="text-[9px] font-mono px-1 py-0.5 rounded bg-zinc-900/90 text-zinc-300 border border-zinc-700/60 flex-shrink-0">${scorePercent}%</span>
             `;

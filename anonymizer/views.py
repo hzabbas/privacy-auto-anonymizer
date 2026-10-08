@@ -66,14 +66,11 @@ def analyze_image_api(request):
                 "message": "Uploaded image file is empty."
             }, status=400)
 
-        # Decode image from buffer into OpenCV BGR numpy ndarray
-        nparr = np.frombuffer(file_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if frame is None or frame.size == 0:
+        # Pass raw bytes directly to ml_pipeline to let it handle decoding and EXIF rotation
+        if not file_bytes:
             return JsonResponse({
                 "status": "error",
-                "message": "Failed to decode image. Ensure file is a valid image format (JPEG, PNG, WEBP, etc.)."
+                "message": "Uploaded image file is empty."
             }, status=400)
 
         # Optional confidence threshold override
@@ -84,8 +81,16 @@ def analyze_image_api(request):
         except ValueError:
             conf_threshold = 0.40
 
+        ocr_engine = request.POST.get('ocr_engine', 'easyocr')
+        layout_engine = request.POST.get('layout_engine', 'regex')
+
         # Run AI entity detection pipeline
-        analysis_result = analyze_image_entities(frame, conf_threshold=conf_threshold)
+        analysis_result = analyze_image_entities(
+            file_bytes, 
+            conf_threshold=conf_threshold,
+            ocr_engine=ocr_engine,
+            layout_engine=layout_engine
+        )
 
         return JsonResponse(analysis_result, status=200)
 

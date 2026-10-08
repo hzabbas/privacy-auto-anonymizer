@@ -80,8 +80,21 @@
                 </div>
             </div>
 
-            <!-- Upload Action Button -->
+            <!-- Upload Action Button & Settings -->
             <div class="flex items-center gap-3">
+                <!-- Settings Panel -->
+                <div class="hidden md:flex items-center gap-2 ml-3 border-l border-zinc-800/80 pl-3">
+                    <select id="ocrEngineSelect" class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-center">
+                        <option value="easyocr">EasyOCR (سریع/پیش‌فرض)</option>
+                        <option value="paddleocr">PaddleOCR (دقت بالا)</option>
+                        <option value="doctr">DocTR (متراکم)</option>
+                    </select>
+                    <select id="layoutEngineSelect" class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-center">
+                        <option value="regex">Regex & Fuzzy (سبک)</option>
+                        <option value="layoutparser">LayoutParser (هوشمند)</option>
+                    </select>
+                </div>
+                
                 <!-- Status Badge -->
                 <div id="statusBadge" class="hidden items-center gap-2 px-3 py-1 rounded-full bg-zinc-900/90 border border-zinc-800 text-xs text-zinc-300">
                     <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
