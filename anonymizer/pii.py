@@ -274,13 +274,13 @@ _SECRET_LABELS = (
     r"access[ \t_\-]?(?:key|token)|auth(?:entication)?[ \t_\-]?token|token|username|user[ \t_\-]?(?:name|id)|login"
 )
 _ID_LABELS = (
-    r"passport|passeport|driver'?s?[ \t]+licen[cs]e|licen[cs]e|account|acct|a/c|routing|sort[ \t]+code|swift|bic|"
+    r"passport|passeport|passport\s+no\.?/\s*n°?\s*de\s*passeport|driver'?s?[ \t]+licen[cs]e|licen[cs]e|account|acct|a/c|routing|sort[ \t]+code|swift|bic|"
     r"member(?:ship)?|policy|patient|mrn|medical[ \t]+record|employee|staff|student|customer|client|"
     r"tax(?:payer)?|tin|ein|itin|vat|nhs|national[ \t]+(?:insurance|id)|ni|id|identification|"
     r"case|claim|invoice|order|reference|ref|tracking|serial|card|badge|voter|visa|permit"
 )
 _NAME_LABELS = (
-    r"nom\s*/\s*surname|prenoms\s*/\s*given\s+names|surname|given\s+names|first\s+name|last\s+name|full\s+name|name|nom|prenoms"
+    r"surname\s*/\s*nom|given\s+names\s*/\s*pr[eé]noms|nom\s*/\s*surname|prenoms\s*/\s*given\s+names|surname|given\s+names|first\s+name|last\s+name|full\s+name|name|nom|prenoms"
 )
 NAME_VALUE_RE = re.compile(
     rf"(?i)\b(?:{_NAME_LABELS})\b[ \t\n/:]*([A-Z][A-Za-z\-]+(?:[ \t]+[A-Z][A-Za-z\-]+)*)"
@@ -288,10 +288,10 @@ NAME_VALUE_RE = re.compile(
 # Only explicit "label: value" / "label=value" forms. The prose form "password is ..."
 # was dropped: "your password is required" is not a secret.
 SECRET_VALUE_RE = re.compile(
-    rf"(?i)\b(?:{_SECRET_LABELS})\b[ \t]*[:=#][ \t]*(\S{{3,}})"
+    rf"(?i)\b(?:{_SECRET_LABELS})\b[ \t\n]*[:=#][ \t\n]*(\S{{3,}})"
 )
 ID_VALUE_RE = re.compile(
-    rf"(?i)\b(?:{_ID_LABELS})\b[ \t]*(?:no\.?|num(?:ber)?\.?|#|id|code)?[ \t]*[:#=\-]?[ \t]*"
+    rf"(?i)\b(?:{_ID_LABELS})\b[ \t\n]*(?:no\.?|num(?:ber)?\.?|#|id|code)?[ \t\n]*[:#=\-]?[ \t\n]*"
     r"([A-Za-z0-9][A-Za-z0-9\-/.]{3,}[A-Za-z0-9])"
 )
 
@@ -440,7 +440,7 @@ def _pattern_spans(text: str) -> List[PIISpan]:
     # ----------------------------------------------------------------------- #
     # Machine Readable Zone (MRZ) parser for Passports / IDs
     # ----------------------------------------------------------------------- #
-    MRZ_RE = re.compile(r"(?<![A-Z0-9<])[A-Z0-9<]{26,}(?![A-Z0-9<])")
+    MRZ_RE = re.compile(r"(?<![A-Z0-9<])[A-Z0-9< ]{26,}(?![A-Z0-9<])")
     mrz_matches = [m for m in MRZ_RE.finditer(text.upper()) if "<" in m.group() and sum(c.isalpha() for c in m.group()) >= 2]
     
     mrz_texts = [m.group() for m in mrz_matches]

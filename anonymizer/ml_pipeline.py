@@ -167,7 +167,7 @@ class ModelManager:
                 if self._paddle_ocr_reader is None:
                     try:
                         from paddleocr import PaddleOCR
-                        self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='fa')
+                        self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='en')
                         print("[ML-Pipeline] Loaded PaddleOCR (Persian/English).")
                     except ImportError:
                         print("[ML-Pipeline] Warning: PaddleOCR not installed.")
