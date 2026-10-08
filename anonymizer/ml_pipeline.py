@@ -588,7 +588,11 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
     from doctr.io import DocumentFile
     
     def _run_doctr_on_img(img_array):
-        rgb_img = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+        if len(img_array.shape) == 2:
+            rgb_img = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb_img = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+            
         doc = DocumentFile.from_images([rgb_img])
         result = doctr(doc)
         res_list = []
@@ -598,6 +602,10 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
                 for line in block.lines:
                     text = " ".join(word.value for word in line.words)
                     if not text.strip(): continue
+                    
+                    if text.count('<') >= 2:
+                        text = text.replace(" ", "")
+                        
                     conf = sum(word.confidence for word in line.words) / len(line.words)
                     xmin, ymin = line.geometry[0]
                     xmax, ymax = line.geometry[1]
