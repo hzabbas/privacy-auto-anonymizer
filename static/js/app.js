@@ -112,6 +112,17 @@ class AnonymizerStudio {
             });
         }
 
+        // Engine select change listeners for Auto-Reanalyze
+        const ocrSelect = document.getElementById('ocrEngineSelect');
+        const layoutSelect = document.getElementById('layoutEngineSelect');
+        const reanalyzeHandler = () => {
+            if (this.currentFile) {
+                this.analyzeImage(this.currentFile);
+            }
+        };
+        if (ocrSelect) ocrSelect.addEventListener('change', reanalyzeHandler);
+        if (layoutSelect) layoutSelect.addEventListener('change', reanalyzeHandler);
+
         // Canvas Click & Hover for Hit Testing (Human-in-the-loop)
         this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
         this.canvas.addEventListener('mousemove', (e) => this.handleCanvasMouseMove(e));
@@ -382,10 +393,37 @@ class AnonymizerStudio {
             }
         } catch (error) {
             console.error('[Anonymizer] Error during image analysis:', error);
-            alert(`خطا در تحلیل تصویر: ${error.message}`);
+            this.detections = [];
+            this.clearCalloutLayers();
+            this.render();
+            if (this.statusBadge) this.statusBadge.classList.add('hidden');
+            if (typeof this.showToast === 'function') {
+                this.showToast(`خطا: ${error.message}`, true);
+            } else {
+                alert(`خطا در تحلیل تصویر: ${error.message}`);
+            }
         } finally {
             this.setLoading(false);
         }
+    }
+
+    showToast(message, isError = false) {
+        let toast = document.getElementById('app-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'app-toast';
+            toast.className = 'fixed bottom-5 right-5 px-4 py-3 rounded-lg shadow-xl text-sm font-medium z-[100] transition-all duration-300 translate-y-20 opacity-0';
+            document.body.appendChild(toast);
+        }
+        
+        toast.className = `fixed bottom-5 right-5 px-4 py-3 rounded-lg shadow-xl text-sm font-medium z-[100] transition-all duration-300 transform translate-y-0 opacity-100 ${isError ? 'bg-red-500/90 text-white' : 'bg-zinc-800 text-emerald-400'}`;
+        toast.textContent = message;
+        
+        if (this.toastTimeout) clearTimeout(this.toastTimeout);
+        this.toastTimeout = setTimeout(() => {
+            toast.classList.replace('translate-y-0', 'translate-y-20');
+            toast.classList.replace('opacity-100', 'opacity-0');
+        }, 4000);
     }
 
     setLoading(loading) {

@@ -170,8 +170,7 @@ class ModelManager:
                         self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
                         print("[ML-Pipeline] Loaded PaddleOCR.")
                     except ImportError:
-                        print("[ML-Pipeline] PaddleOCR not installed. Using Stub.")
-                        self._paddle_ocr_reader = "STUB_PADDLEOCR"
+                        raise ValueError("مدل PaddleOCR روی سرور نصب نیست. لطفاً آن را نصب کنید.")
         return self._paddle_ocr_reader
 
     @property
@@ -186,8 +185,7 @@ class ModelManager:
                         self._doctr_reader = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
                         print("[ML-Pipeline] Loaded DocTR.")
                     except ImportError:
-                        print("[ML-Pipeline] DocTR not installed. Using Stub.")
-                        self._doctr_reader = "STUB_DOCTR"
+                        raise ValueError("مدل DocTR روی سرور نصب نیست. لطفاً آن را نصب کنید.")
         return self._doctr_reader
         
     @property
@@ -202,8 +200,7 @@ class ModelManager:
                         self._layout_parser = lp.Detectron2LayoutModel('lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config', extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5])
                         print("[ML-Pipeline] Loaded LayoutParser.")
                     except ImportError:
-                        print("[ML-Pipeline] LayoutParser not installed. Using Stub.")
-                        self._layout_parser = "STUB_LAYOUTPARSER"
+                        raise ValueError("مدل LayoutParser روی سرور نصب نیست. لطفاً آن را نصب کنید.")
         return self._layout_parser
 
 # Global singleton instance
@@ -538,11 +535,6 @@ def _run_easyocr_pipeline(image: np.ndarray, width: int, height: int) -> List[Di
 
 def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int) -> List[Dict[str, Any]]:
     paddle = _model_manager.paddle_ocr_reader
-    if paddle == "STUB_PADDLEOCR":
-        print("[ML-Pipeline] PaddleOCR stub detected, falling back to EasyOCR")
-        return _run_easyocr_pipeline(image, width, height)
-
-    # Simple processing for PaddleOCR stub
     ocr_image, mrz_crop, y_offset, M_inv = preprocess_for_ocr(image)
     results = paddle.ocr(ocr_image, cls=True)
     ocr_results = []
@@ -555,14 +547,23 @@ def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int) -> List[
 
 def _run_doctr_pipeline(image: np.ndarray, width: int, height: int) -> List[Dict[str, Any]]:
     doctr = _model_manager.doctr_reader
-    if doctr == "STUB_DOCTR":
-        print("[ML-Pipeline] DocTR stub detected, falling back to EasyOCR")
-        return _run_easyocr_pipeline(image, width, height)
-    
+    # Basic implementation since doctr expects different image formats
+    # For now, we will extract text using doctr prediction
     from doctr.io import DocumentFile
-    # DocTR expects RGB images in channels last format or raw bytes
-    # For simplicity, fallback to EasyOCR in stub for now
-    return _run_easyocr_pipeline(image, width, height)
+    doc = DocumentFile.from_images([image])
+    result = doctr(doc)
+    ocr_results = []
+    for page in result.pages:
+        for block in page.blocks:
+            for line in block.lines:
+                text = " ".join(word.value for word in line.words)
+                conf = sum(word.confidence for word in line.words) / len(line.words)
+                # doctr bbox is (xmin, ymin, xmax, ymax) in relative coords (0-1)
+                xmin, ymin = line.geometry[0]
+                xmax, ymax = line.geometry[1]
+                bbox = [[xmin*width, ymin*height], [xmax*width, ymin*height], [xmax*width, ymax*height], [xmin*width, ymax*height]]
+                ocr_results.append((bbox, text, conf))
+    return _ocr_pii_detections(ocr_results, width, height)
 
 
 def analyze_image_entities(
@@ -652,29 +653,60 @@ def analyze_image_entities(
 
     # 3. Dynamic OCR & Layout strategy -------------------------------------- #
     try:
+        lp_blocks = []
         if layout_engine == 'layoutparser':
             lp_model = _model_manager.layout_parser
-            if lp_model == "STUB_LAYOUTPARSER":
-                print("[ML-Pipeline] LayoutParser stub detected. Falling back to Regex/Fuzzy Layout.")
-            else:
-                # Stub layout parsing execution path
-                pass
+            layout = lp_model.detect(image)
+            # Filter for Text blocks
+            for block in layout:
+                if block.type in ["Text", "Title", "List"]:
+                    x1, y1, x2, y2 = block.coordinates
+                    lp_blocks.append([int(x1), int(y1), int(x2), int(y2)])
 
         text_dets = []
-        if ocr_engine == 'paddleocr':
-            text_dets = _run_paddleocr_pipeline(image, width, height)
-        elif ocr_engine == 'doctr':
-            text_dets = _run_doctr_pipeline(image, width, height)
-        else: # easyocr
-            text_dets = _run_easyocr_pipeline(image, width, height)
+        if layout_engine == 'layoutparser' and lp_blocks:
+            # Run OCR ONLY on detected layout blocks
+            for block in lp_blocks:
+                bx1, by1, bx2, by2 = block
+                # Ensure valid crop
+                bx1, by1 = max(0, bx1), max(0, by1)
+                bx2, by2 = min(width, bx2), min(height, by2)
+                if bx2 - bx1 > 10 and by2 - by1 > 10:
+                    crop = image[by1:by2, bx1:bx2]
+                    crop_h, crop_w = crop.shape[:2]
+                    
+                    if ocr_engine == 'paddleocr':
+                        block_dets = _run_paddleocr_pipeline(crop, crop_w, crop_h)
+                    elif ocr_engine == 'doctr':
+                        block_dets = _run_doctr_pipeline(crop, crop_w, crop_h)
+                    else:
+                        block_dets = _run_easyocr_pipeline(crop, crop_w, crop_h)
+                        
+                    # Shift coordinates back to original image
+                    for det in block_dets:
+                        d_bx = det["bbox"]
+                        det["bbox"] = [d_bx[0] + bx1, d_bx[1] + by1, d_bx[2] + bx1, d_bx[3] + by1]
+                        if "polygon" in det:
+                            det["polygon"] = [[p[0] + bx1, p[1] + by1] for p in det["polygon"]]
+                        text_dets.append(det)
+        else:
+            if ocr_engine == 'paddleocr':
+                text_dets = _run_paddleocr_pipeline(image, width, height)
+            elif ocr_engine == 'doctr':
+                text_dets = _run_doctr_pipeline(image, width, height)
+            else: # easyocr
+                text_dets = _run_easyocr_pipeline(image, width, height)
 
         plates = [d["bbox"] for d in detections if d["type"] == "plate"]
         for d in text_dets:
             if any(_iou(d["bbox"], p) > 0.5 for p in plates):
                 continue
             detections.append(d)
+    except ValueError as ve:
+        raise ve
     except Exception as e:
         print(f"[ML-Pipeline] Text OCR detection warning: {e}")
+        # Allow other engines to fail gracefully unless it's a direct ValueError from our strict handling
 
     for i, d in enumerate(detections, start=1):
         d["id"] = i

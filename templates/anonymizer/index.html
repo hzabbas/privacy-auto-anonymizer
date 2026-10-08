@@ -65,7 +65,7 @@
 
     <!-- Minimalist Engineering Header -->
     <header class="border-b border-zinc-800/60 bg-[#09090b]/80 backdrop-blur-md sticky top-0 z-50">
-        <div class="max-w-6xl mx-auto px-5 sm:px-8 h-14 flex items-center justify-between">
+        <div class="max-w-6xl mx-auto px-5 sm:px-8 py-3 min-h-[3.5rem] flex flex-wrap items-center justify-between gap-4">
             <!-- Brand Info -->
             <div class="flex items-center gap-3">
                 <div class="w-7 h-7 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-200">
@@ -81,9 +81,9 @@
             </div>
 
             <!-- Upload Action Button & Settings -->
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-3">
                 <!-- Settings Panel -->
-                <div class="hidden md:flex items-center gap-2 ml-3 border-l border-zinc-800/80 pl-3">
+                <div class="flex items-center gap-2 sm:ml-3 sm:border-l border-zinc-800/80 sm:pl-3">
                     <select id="ocrEngineSelect" class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-center">
                         <option value="easyocr">EasyOCR (سریع/پیش‌فرض)</option>
                         <option value="paddleocr">PaddleOCR (دقت بالا)</option>

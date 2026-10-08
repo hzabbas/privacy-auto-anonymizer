@@ -94,6 +94,12 @@ def analyze_image_api(request):
 
         return JsonResponse(analysis_result, status=200)
 
+    except ValueError as ve:
+        logger.error("Validation error: %s", ve)
+        return JsonResponse({
+            "status": "error",
+            "message": str(ve)
+        }, status=400)
     except Exception as exc:
         logger.exception("Error analyzing image entities: %s", exc)
         return JsonResponse({
