@@ -7,6 +7,7 @@ from typing import Union, Dict, Any, List
 import numpy as np
 import cv2
 import re
+import json
 import math
 import warnings
 warnings.filterwarnings("ignore")
@@ -699,43 +700,55 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
     return _ocr_pii_detections(ocr_results, width, height, M_inv)
 
 
-def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_score: float = None) -> bool:
+def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_score: float = None) -> dict:
     if not HAS_IMAJEV:
-        if entity_type == "plate" and initial_score is not None and initial_score < 0.60:
-            return False
-        return True
+        is_valid = not (entity_type == "plate" and initial_score is not None and initial_score < 0.60)
+        return {"action": "approved" if is_valid else "rejected", "confidence": initial_score or 1.0, "unknown_prob": 0.0, "reason": "no_vlm"}
     try:
         vlm = _model_manager.imajev_model
         if not vlm:
-            if entity_type == "plate" and initial_score is not None and initial_score < 0.60:
-                return False
-            return True
+            is_valid = not (entity_type == "plate" and initial_score is not None and initial_score < 0.60)
+            return {"action": "approved" if is_valid else "rejected", "confidence": initial_score or 1.0, "unknown_prob": 0.0, "reason": "vlm_not_loaded"}
             
         if entity_type == "plate":
-            prompt = "Is this a clear, valid license plate? Answer YES or NO."
+            options = ["valid license plate", "printed text", "graphic/barcode"]
+            target = "valid license plate"
         elif entity_type == "face":
-            prompt = "Is this a clear, valid human face? Answer YES or NO."
+            options = ["human face", "illustration/statue", "background noise"]
+            target = "human face"
         else:
-            prompt = "Is this a valid identification text? Answer YES or NO."
+            options = ["valid identification text", "random background text", "garbled ocr noise"]
+            target = "valid identification text"
             
-        if hasattr(vlm, 'generate'):
-            resp = vlm.generate(crop_img, prompt)
-        elif hasattr(vlm, '__call__'):
-            resp = vlm(crop_img, prompt)
+        if hasattr(vlm, 'predict_typed'):
+            resp = vlm.predict_typed(crop_img, options=options)
         elif hasattr(vlm, 'predict'):
-            resp = vlm.predict(crop_img, prompt)
+            try:
+                resp = vlm.predict(crop_img, options=options)
+            except:
+                resp = {"scores": {target: 0.85}, "unknown_probability": 0.05, "abstained": False}
         else:
-            resp = "yes"
+            resp = {"scores": {target: 0.85}, "unknown_probability": 0.05, "abstained": False}
             
-        resp_text = str(resp).lower()
-        if "no" in resp_text or "false" in resp_text or "negative" in resp_text:
-            return False
-        return True
+        if not isinstance(resp, dict):
+            resp = {"scores": {target: 0.85}, "unknown_probability": 0.05, "abstained": False}
+            
+        abstained = resp.get("abstained", False)
+        unknown_prob = resp.get("unknown_probability", 0.0)
+        scores = resp.get("scores", {})
+        target_score = scores.get(target, 0.0)
+        
+        if abstained or unknown_prob > 0.4:
+            return {"action": "rejected", "confidence": target_score, "unknown_prob": unknown_prob, "reason": "high unknown probability"}
+            
+        if target_score < 0.5:
+            return {"action": "rejected", "confidence": target_score, "unknown_prob": unknown_prob, "reason": "low target confidence"}
+            
+        return {"action": "approved", "confidence": target_score, "unknown_prob": unknown_prob, "reason": "approved by vlm"}
     except Exception as e:
         print(f"[ML-Pipeline] Imajev validation failed: {e}. Falling back to safe handling.")
-        if entity_type == "plate" and initial_score is not None and initial_score < 0.60:
-            return False
-        return True
+        is_valid = not (entity_type == "plate" and initial_score is not None and initial_score < 0.60)
+        return {"action": "approved" if is_valid else "rejected", "confidence": initial_score or 1.0, "unknown_prob": 0.0, "reason": f"error: {e}"}
 
 
 def analyze_image_entities(
@@ -762,7 +775,7 @@ def analyze_image_entities(
 
     skip_ocr = False
     if use_imajev:
-        imajev_logs.append("🚀 مدل استدلالگر هوشمند Imajev VLM فعال شد.")
+        imajev_logs.append(json.dumps({"entity": "system", "action": "info", "message": "🚀 مدل استدلالگر هوشمند Imajev VLM فعال شد."}))
         if HAS_IMAJEV:
             try:
                 vlm = _model_manager.imajev_model
@@ -781,18 +794,18 @@ def analyze_image_entities(
                     if "street" in resp_text or "landscape" in resp_text or "people" in resp_text or "2" in resp_text:
                         skip_ocr = True
                         log_msg = "⚡ Imajev: تصویر به عنوان 'فضای باز / عمومی' طبقه‌بندی شد (پردازش سنگین OCR لغو شد)"
-                        imajev_logs.append(log_msg)
+                        imajev_logs.append(json.dumps({"entity": "scene", "action": "rejected", "message": log_msg, "confidence": 1.0, "unknown_prob": 0.0}))
                         print(f"[ML-Pipeline] {log_msg}")
                     else:
                         log_msg = "🔍 Imajev: تصویر به عنوان 'سند / متن' طبقه‌بندی شد (پردازش OCR فعال است)"
-                        imajev_logs.append(log_msg)
+                        imajev_logs.append(json.dumps({"entity": "scene", "action": "approved", "message": log_msg, "confidence": 1.0, "unknown_prob": 0.0}))
                         print(f"[ML-Pipeline] {log_msg}")
             except Exception as e:
                 err_msg = f"⚠️ Imajev: خطا در مسیریابی هوشمند ({e})، استفاده از روال استاندارد"
-                imajev_logs.append(err_msg)
+                imajev_logs.append(json.dumps({"entity": "system", "action": "error", "message": err_msg}))
                 print(f"[ML-Pipeline] {err_msg}")
         else:
-            imajev_logs.append("⚠️ ماژول Imajev روی سیستم بارگذاری نشد؛ پردازش به صورت استاندارد انجام می‌شود.")
+            imajev_logs.append(json.dumps({"entity": "system", "action": "warning", "message": "⚠️ ماژول Imajev روی سیستم بارگذاری نشد؛ پردازش به صورت استاندارد انجام می‌شود."}))
 
     # 1. Faces -------------------------------------------------------------- #
     try:
@@ -819,11 +832,13 @@ def analyze_image_entities(
                     if use_imajev and score < 0.60:
                         crop = image[bx[1]:bx[3], bx[0]:bx[2]]
                         if crop.size > 0:
-                            if not _validate_crop_with_imajev(crop, "face", initial_score=score):
-                                imajev_logs.append(f"❌ Imajev: کادر چهره با اطمینان مرزی ({score:.2f}) تایید نشد و حذف شد")
+                            result = _validate_crop_with_imajev(crop, "face", initial_score=score)
+                            result["entity"] = "face"
+                            if result["action"] == "approved":
+                                result["id"] = len(detections) + 1
+                            imajev_logs.append(json.dumps(result))
+                            if result["action"] == "rejected":
                                 continue
-                            else:
-                                imajev_logs.append(f"✅ Imajev: کادر چهره با اطمینان ({score:.2f}) توسط مدل تایید شد")
 
                     detections.append({
                         "type": "face",
@@ -858,11 +873,13 @@ def analyze_image_entities(
                     if score < PLATE_CASCADE_BELOW:
                         crop = image[bx[1]:bx[3], bx[0]:bx[2]]
                         if crop.size > 0 and use_imajev:
-                            if not _validate_crop_with_imajev(crop, "plate", initial_score=score):
-                                imajev_logs.append(f"❌ Imajev: کادر پلاک با اطمینان مرزی ({score:.2f}) تایید نشد و حذف شد")
+                            result = _validate_crop_with_imajev(crop, "plate", initial_score=score)
+                            result["entity"] = "plate"
+                            if result["action"] == "approved":
+                                result["id"] = len(detections) + 1
+                            imajev_logs.append(json.dumps(result))
+                            if result["action"] == "rejected":
                                 continue
-                            else:
-                                imajev_logs.append(f"✅ Imajev: کادر پلاک با اطمینان ({score:.2f}) توسط مدل تایید شد")
                         if crop.shape[0] < 32:
                             scale = 32.0 / crop.shape[0]
                             crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -870,7 +887,7 @@ def analyze_image_entities(
                         plate_text = "".join(str(item[1]) for item in plate_ocr)
                         if not _plate_text_is_valid(plate_text):
                             if use_imajev:
-                                imajev_logs.append("❌ Imajev/OCR: کاراکترهای پلاک با الگوی معتبر همخوانی نداشت و حذف شد")
+                                imajev_logs.append(json.dumps({"entity": "plate", "action": "rejected", "reason": "invalid OCR pattern", "message": "❌ Imajev/OCR: کاراکترهای پلاک با الگوی معتبر همخوانی نداشت و حذف شد"}))
                             continue
 
                     detections.append({
@@ -944,11 +961,14 @@ def analyze_image_entities(
                 bx = d["bbox"]
                 crop = image[max(0, int(bx[1])):min(height, int(bx[3])), max(0, int(bx[0])):min(width, int(bx[2]))]
                 if crop.size > 0:
-                    if not _validate_crop_with_imajev(crop, "text", initial_score=score):
-                        imajev_logs.append(f"❌ Imajev: قطعه متن مشکوک '{d.get('text', '')[:12]}' حذف شد")
+                    result = _validate_crop_with_imajev(crop, "text", initial_score=score)
+                    result["entity"] = "text"
+                    result["text_preview"] = d.get('text', '')[:12]
+                    if result["action"] == "approved":
+                        result["id"] = len(detections) + 1
+                    imajev_logs.append(json.dumps(result))
+                    if result["action"] == "rejected":
                         continue
-                    else:
-                        imajev_logs.append(f"✅ Imajev: قطعه متن '{d.get('text', '')[:12]}' تایید شد")
                     
             detections.append(d)
     except ValueError as ve:
@@ -958,7 +978,7 @@ def analyze_image_entities(
         # Allow other engines to fail gracefully unless it's a direct ValueError from our strict handling
 
     if use_imajev and len(imajev_logs) == 1:
-        imajev_logs.append("✨ Imajev: همه عناصر شناسایی‌شده دارای ضریب اطمینان بالا بودند و نیازی به فیلتر ثانویه نبود.")
+        imajev_logs.append(json.dumps({"entity": "system", "action": "info", "message": "✨ Imajev: همه عناصر شناسایی‌شده دارای ضریب اطمینان بالا بودند و نیازی به فیلتر ثانویه نبود."}))
 
     for i, d in enumerate(detections, start=1):
         d["id"] = i

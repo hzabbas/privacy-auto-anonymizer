@@ -1229,9 +1229,6 @@ class AnonymizerStudio {
         }, 150);
     }
 
-    /**
-     * Renders Imajev reasoning decisions with staggered fade-in animation.
-     */
     renderImajevLogs(logs) {
         const container = document.getElementById('imajevLogContent');
         const countBadge = document.getElementById('imajevLogCount');
@@ -1252,29 +1249,95 @@ class AnonymizerStudio {
             return;
         }
 
-        logs.forEach((logText, index) => {
+        logs.forEach((logStr, index) => {
+            let logData = {};
+            try {
+                logData = JSON.parse(logStr);
+            } catch (e) {
+                logData = { entity: 'system', message: logStr, action: 'info' };
+            }
+            
             const item = document.createElement('div');
-            item.className = 'flex items-start gap-2 p-2 rounded-lg bg-zinc-900/70 border border-zinc-800/60 text-zinc-300 text-[11px] leading-relaxed transition-all duration-300 opacity-0 translate-y-2';
+            item.className = 'flex flex-col gap-1.5 p-3 rounded-lg bg-zinc-900/70 border border-zinc-800/60 transition-all duration-300 opacity-0 translate-y-2 relative overflow-hidden group cursor-pointer';
 
-            let dotColor = 'bg-cyan-400';
-            if (logText.includes('❌')) dotColor = 'bg-rose-500';
-            else if (logText.includes('✅')) dotColor = 'bg-emerald-400';
-            else if (logText.includes('⚡')) dotColor = 'bg-amber-400';
-            else if (logText.includes('⚠️')) dotColor = 'bg-orange-500';
-            else if (logText.includes('🚀')) dotColor = 'bg-cyan-400';
+            if (logData.id) {
+                item.dataset.detectionId = logData.id;
+                
+                // Canvas coordination: hover effects
+                item.addEventListener('mouseenter', () => {
+                    if (this.hoveredDetectionId !== logData.id) {
+                        this.hoveredDetectionId = logData.id;
+                        this.render();
+                    }
+                });
+                item.addEventListener('mouseleave', () => {
+                    if (this.hoveredDetectionId === logData.id) {
+                        this.hoveredDetectionId = null;
+                        this.render();
+                    }
+                });
+            }
 
-            const cleanText = logText
-                .replace(/^(\s*[❌✅⚡⚠️🔍🚀✨]\s*Imajev(?:\/OCR)?:\s*)/, '')
-                .trim();
-            const prefixMatch = logText.match(/^(\s*[❌✅⚡⚠️🔍🚀✨]\s*Imajev(?:\/OCR)?)/);
-            const prefix = prefixMatch ? prefixMatch[1] : 'Imajev';
+            let actionMarkup = '';
+            let barColor = 'bg-cyan-500';
+            
+            if (logData.action === 'approved') {
+                actionMarkup = `<span class="text-emerald-400 font-bold tracking-widest">[APPROVED]</span>`;
+                barColor = 'bg-emerald-500';
+            } else if (logData.action === 'rejected') {
+                actionMarkup = `<span class="text-red-400 font-bold tracking-widest">[REJECTED]</span>`;
+                barColor = 'bg-red-500';
+            } else if (logData.action === 'error') {
+                actionMarkup = `<span class="text-orange-500 font-bold tracking-widest">[ERROR]</span>`;
+                barColor = 'bg-orange-500';
+            } else {
+                actionMarkup = `<span class="text-cyan-400 font-bold tracking-widest">[INFO]</span>`;
+            }
+
+            let title = logData.entity ? logData.entity.toUpperCase() : 'SYSTEM';
+            if (logData.text_preview) title += ` - "${logData.text_preview}"`;
+            
+            let messageMarkup = logData.message ? `<div class="text-[11px] text-zinc-300 mt-1">${this.escapeHtml(logData.message)}</div>` : '';
+            if (logData.reason && !logData.message) {
+                 messageMarkup = `<div class="text-[11px] text-zinc-300 mt-1">Reason: ${this.escapeHtml(logData.reason)}</div>`;
+            }
+
+            let metricsMarkup = '';
+            if (logData.confidence !== undefined) {
+                const confPercent = Math.round(logData.confidence * 100);
+                const unkPercent = logData.unknown_prob !== undefined ? Math.round(logData.unknown_prob * 100) : 0;
+                
+                metricsMarkup = `
+                    <div class="flex items-center gap-4 mt-1.5 text-[10px]">
+                        <div class="flex-1">
+                            <div class="flex justify-between mb-1">
+                                <span class="text-zinc-400">Confidence</span>
+                                <span class="text-zinc-200">${confPercent}%</span>
+                            </div>
+                            <div class="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+                                <div class="${barColor} h-full rounded-full" style="width: ${confPercent}%"></div>
+                            </div>
+                        </div>
+                        <div class="flex-1">
+                            <div class="flex justify-between mb-1">
+                                <span class="text-zinc-400">Unknown Prob</span>
+                                <span class="text-zinc-200">${unkPercent}%</span>
+                            </div>
+                            <div class="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+                                <div class="bg-amber-500 h-full rounded-full" style="width: ${unkPercent}%"></div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
 
             item.innerHTML = `
-                <span class="inline-block w-1.5 h-1.5 rounded-full ${dotColor} mt-1.5 flex-shrink-0 shadow-[0_0_6px_currentColor]"></span>
-                <div class="flex-1">
-                    <span class="font-bold text-zinc-200">${this.escapeHtml(prefix)}:</span>
-                    <span class="text-zinc-300">${this.escapeHtml(cleanText)}</span>
+                <div class="flex items-center justify-between text-xs font-mono">
+                    <span class="text-zinc-100 font-semibold">${title}</span>
+                    ${actionMarkup}
                 </div>
+                ${messageMarkup}
+                ${metricsMarkup}
             `;
             container.appendChild(item);
 
