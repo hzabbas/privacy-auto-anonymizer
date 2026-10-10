@@ -83,7 +83,7 @@
             <!-- Upload Action Button & Settings -->
             <div class="flex flex-wrap items-center gap-3">
                 <!-- Settings Panel -->
-                <div class="flex items-center gap-2 sm:ml-3 sm:border-l border-zinc-800/80 sm:pl-3">
+                <div class="flex flex-wrap items-center gap-2 sm:ml-3 sm:border-l border-zinc-800/80 sm:pl-3">
                     <select id="ocrEngineSelect" class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-center">
                         <option value="easyocr">EasyOCR (سریع/پیش‌فرض)</option>
                         <option value="paddleocr">PaddleOCR (دقت بالا)</option>
@@ -93,6 +93,15 @@
                         <option value="regex">Regex & Fuzzy (سبک)</option>
                         <option value="layoutparser">LayoutParser (هوشمند)</option>
                     </select>
+
+                    <!-- Imajev VLM Toggle Switch -->
+                    <label for="imajevToggle" class="relative inline-flex items-center gap-2 cursor-pointer select-none bg-zinc-900/60 hover:bg-zinc-900 border border-zinc-800 hover:border-zinc-700 text-zinc-300 hover:text-white rounded-lg px-2.5 py-1.5 transition-all">
+                        <input type="checkbox" id="imajevToggle" class="sr-only peer">
+                        <div class="w-7 h-4 bg-zinc-800 rounded-full border border-zinc-700 peer-checked:bg-cyan-950 peer-checked:border-cyan-500/80 transition-colors relative flex items-center">
+                            <span class="w-2.5 h-2.5 bg-zinc-400 peer-checked:bg-cyan-400 rounded-full transition-transform duration-200 translate-x-0.5 peer-checked:translate-x-3.5 shadow-sm"></span>
+                        </div>
+                        <span class="text-[11px] font-medium tracking-tight">فعالسازی Imajev (استدلالگر)</span>
+                    </label>
                 </div>
                 
                 <!-- Status Badge -->
@@ -115,7 +124,7 @@
     </header>
 
     <!-- Main Workspace -->
-    <main class="flex-1 max-w-6xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-4">
+    <main id="mainWorkspace" class="flex-1 max-w-6xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-4 transition-all duration-300">
         
         <!-- Legend (Entity Color Guides) -->
         <div id="legendContainer" class="hidden items-center justify-between text-xs px-2 text-zinc-400">
@@ -139,44 +148,97 @@
             </div>
         </div>
 
-        <!-- Central Canvas / Dropzone Area -->
-        <div id="dropzoneContainer" class="flex-1 bg-[#0c0c0e] border border-dashed border-zinc-800/80 hover:border-zinc-700 rounded-xl relative flex flex-col items-center justify-center min-h-[500px] overflow-hidden transition-all duration-300 group canvas-grid">
+        <!-- Central Workspace Grid (Canvas + Imajev Log Panel) -->
+        <div id="workspaceGrid" class="flex-1 w-full grid grid-cols-1 gap-4 transition-all duration-300">
             
-            <!-- Empty State / Dropzone -->
-            <div id="placeholderState" class="flex flex-col items-center justify-center text-center p-8 z-10 select-none">
-                <div class="w-14 h-14 rounded-xl bg-zinc-900/90 border border-zinc-800/80 flex items-center justify-center text-zinc-400 mb-4 group-hover:border-zinc-700 group-hover:text-zinc-200 transition-colors duration-300">
-                    <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                        <circle cx="8.5" cy="8.5" r="1.5"/>
-                        <polyline points="21 15 16 10 5 21"/>
-                    </svg>
+            <!-- Central Canvas / Dropzone Area -->
+            <div id="dropzoneContainer" class="w-full bg-[#0c0c0e] border border-dashed border-zinc-800/80 hover:border-zinc-700 rounded-xl relative flex flex-col items-center justify-center min-h-[500px] overflow-hidden transition-all duration-300 group canvas-grid">
+                
+                <!-- Empty State / Dropzone -->
+                <div id="placeholderState" class="flex flex-col items-center justify-center text-center p-8 z-10 select-none">
+                    <div class="w-14 h-14 rounded-xl bg-zinc-900/90 border border-zinc-800/80 flex items-center justify-center text-zinc-400 mb-4 group-hover:border-zinc-700 group-hover:text-zinc-200 transition-colors duration-300">
+                        <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                            <circle cx="8.5" cy="8.5" r="1.5"/>
+                            <polyline points="21 15 16 10 5 21"/>
+                        </svg>
+                    </div>
+                    <h3 class="text-sm font-medium text-zinc-200 mb-1">تصویر را اینجا رها کنید</h3>
+                    <p class="text-xs text-zinc-500 max-w-xs mb-5 leading-relaxed">پشتیبانی از فرمت‌های PNG ،JPG و WEBP جهت ردیابی و محو خودکار چهره، پلاک و متون</p>
+                    <label for="dropzoneFileInput" class="cursor-pointer inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-white text-xs font-medium border border-zinc-800/90 transition-all duration-200">
+                        <span>انتخاب فایل</span>
+                    </label>
+                    <input type="file" id="dropzoneFileInput" accept="image/*" class="hidden">
                 </div>
-                <h3 class="text-sm font-medium text-zinc-200 mb-1">تصویر را اینجا رها کنید</h3>
-                <p class="text-xs text-zinc-500 max-w-xs mb-5 leading-relaxed">پشتیبانی از فرمت‌های PNG ،JPG و WEBP جهت ردیابی و محو خودکار چهره، پلاک و متون</p>
-                <label for="dropzoneFileInput" class="cursor-pointer inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-white text-xs font-medium border border-zinc-800/90 transition-all duration-200">
-                    <span>انتخاب فایل</span>
-                </label>
-                <input type="file" id="dropzoneFileInput" accept="image/*" class="hidden">
+
+                <!-- Canvas HUD Container (Standard flex container without restrictive side bounds) -->
+                <div id="canvasContainer" class="relative hidden flex items-center justify-center max-h-[70vh] w-auto my-auto">
+                    <canvas id="editor-canvas" class="block max-w-full max-h-[70vh] rounded-lg shadow-2xl object-contain"></canvas>
+                    <!-- SVG Connector Lines Layer -->
+                    <svg id="connector-layer" class="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible"></svg>
+                    <!-- HTML Callout Labels Layer -->
+                    <div id="labels-layer" class="absolute inset-0 w-full h-full pointer-events-none z-20 overflow-visible"></div>
+                </div>
+
+                <!-- Loading Spinner Overlay -->
+                <div id="loadingOverlay" class="hidden absolute inset-0 z-30 bg-[#09090b]/80 backdrop-blur-sm flex-col items-center justify-center rounded-xl transition-all duration-300">
+                    <div class="relative flex items-center justify-center mb-3">
+                        <div class="w-10 h-10 rounded-full border-2 border-zinc-800 border-t-cyan-500 animate-spin"></div>
+                        <div class="absolute w-5 h-5 rounded-full bg-cyan-500/20 animate-ping"></div>
+                    </div>
+                    <p class="text-xs font-medium text-zinc-200 tracking-wide">در حال پردازش پایپ‌لاین هوش مصنوعی...</p>
+                    <span class="text-[11px] text-zinc-500 mt-1 font-mono">شناسایی خودکار چهره، پلاک و متون حساس</span>
+                </div>
             </div>
 
-            <!-- Canvas HUD Container (Standard flex container without restrictive side bounds) -->
-            <div id="canvasContainer" class="relative hidden flex items-center justify-center max-h-[70vh] w-auto my-auto">
-                <canvas id="editor-canvas" class="block max-w-full max-h-[70vh] rounded-lg shadow-2xl object-contain"></canvas>
-                <!-- SVG Connector Lines Layer -->
-                <svg id="connector-layer" class="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible"></svg>
-                <!-- HTML Callout Labels Layer -->
-                <div id="labels-layer" class="absolute inset-0 w-full h-full pointer-events-none z-20 overflow-visible"></div>
-            </div>
-
-            <!-- Loading Spinner Overlay -->
-            <div id="loadingOverlay" class="hidden absolute inset-0 z-30 bg-[#09090b]/80 backdrop-blur-sm flex-col items-center justify-center rounded-xl transition-all duration-300">
-                <div class="relative flex items-center justify-center mb-3">
-                    <div class="w-10 h-10 rounded-full border-2 border-zinc-800 border-t-cyan-500 animate-spin"></div>
-                    <div class="absolute w-5 h-5 rounded-full bg-cyan-500/20 animate-ping"></div>
+            <!-- Imajev VLM Reasoning Terminal Log Panel -->
+            <aside id="imajevLogPanel" class="hidden flex-col bg-[#0c0c0e] border border-zinc-800/80 rounded-xl overflow-hidden shadow-2xl transition-all duration-300 min-h-[380px] lg:min-h-0">
+                <!-- Terminal Header -->
+                <div class="flex items-center justify-between px-3.5 py-2.5 bg-zinc-900/90 border-b border-zinc-800/80 select-none">
+                    <div class="flex items-center gap-2">
+                        <div class="flex items-center gap-1.5">
+                            <span class="w-2.5 h-2.5 rounded-full bg-red-500/80 shadow-[0_0_6px_rgba(239,68,68,0.4)]"></span>
+                            <span class="w-2.5 h-2.5 rounded-full bg-amber-500/80 shadow-[0_0_6px_rgba(245,158,11,0.4)]"></span>
+                            <span class="w-2.5 h-2.5 rounded-full bg-emerald-500/80 shadow-[0_0_6px_rgba(16,185,129,0.4)]"></span>
+                        </div>
+                        <span class="text-[11px] font-mono text-zinc-300 font-semibold mr-1.5 flex items-center gap-1.5">
+                            <svg class="w-3.5 h-3.5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="4 17 10 11 4 5"/>
+                                <line x1="12" y1="19" x2="20" y2="19"/>
+                            </svg>
+                            Imajev VLM Terminal
+                        </span>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                        <span id="imajevStatusPulse" class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
+                        <span id="imajevStatusText" class="text-[10px] text-zinc-400 font-mono">آماده</span>
+                    </div>
                 </div>
-                <p class="text-xs font-medium text-zinc-200 tracking-wide">در حال پردازش پایپ‌لاین هوش مصنوعی...</p>
-                <span class="text-[11px] text-zinc-500 mt-1 font-mono">شناسایی خودکار چهره، پلاک و متون حساس</span>
-            </div>
+
+                <!-- Terminal Subheader / Mode Badge -->
+                <div class="px-3.5 py-1.5 bg-zinc-950/60 border-b border-zinc-800/40 flex items-center justify-between text-[10px] text-zinc-400 font-mono">
+                    <span class="text-cyan-400/90 font-medium flex items-center gap-1">
+                        <span class="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
+                        استدلالگر و اعتبارسنج بصری
+                    </span>
+                    <span id="imajevLogCount" class="text-zinc-500">0 رویداد</span>
+                </div>
+
+                <!-- Terminal Body (Log Messages Container) -->
+                <div id="imajevLogContent" class="flex-1 p-3.5 font-mono text-xs overflow-y-auto space-y-2.5 max-h-[550px] scrollbar-thin scrollbar-thumb-zinc-800 select-text">
+                    <div id="imajevLogPlaceholder" class="text-zinc-500 text-[11px] leading-relaxed italic p-2.5 bg-zinc-900/30 rounded-lg border border-zinc-800/40">
+                        کنسول استدلال هوشمند فعال است. با بارگذاری تصویر، ردیابی معنایی سند، دورزدن هوشمند OCR و اعتبارسنجی کادرهای مرزی در اینجا به صورت زنده نمایش داده خواهد شد.
+                    </div>
+                </div>
+
+                <!-- Terminal Footer -->
+                <div class="px-3 py-2 bg-zinc-950/80 border-t border-zinc-800/60 flex items-center justify-between text-[10px] text-zinc-500 font-mono">
+                    <span class="flex items-center gap-1">
+                        <span class="text-emerald-400">●</span> VLM Decision Core
+                    </span>
+                    <button type="button" id="btnClearImajevLogs" class="hover:text-zinc-300 text-[10px] transition-colors">پاکسازی</button>
+                </div>
+            </aside>
         </div>
 
         <!-- Bottom Operational Controls -->

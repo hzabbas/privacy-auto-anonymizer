@@ -22,7 +22,7 @@ from . import pii
 # Tunable thresholds -------------------------------------------------------- #
 # Plate detector is noisy on documents (it fires on printed words), so it uses a
 # stricter floor and OCR verification below PLATE_CASCADE_BELOW.
-PLATE_MIN_CONFIDENCE = 0.25
+PLATE_MIN_CONFIDENCE = 0.45
 PLATE_CASCADE_BELOW = 0.60
 # YOLOv8-face boxes are tight; expand each side by this ratio before masking.
 FACE_EXPAND_RATIO = 0.10
@@ -699,12 +699,16 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
     return _ocr_pii_detections(ocr_results, width, height, M_inv)
 
 
-def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str) -> bool:
+def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_score: float = None) -> bool:
     if not HAS_IMAJEV:
+        if entity_type == "plate" and initial_score is not None and initial_score < 0.60:
+            return False
         return True
     try:
         vlm = _model_manager.imajev_model
         if not vlm:
+            if entity_type == "plate" and initial_score is not None and initial_score < 0.60:
+                return False
             return True
             
         if entity_type == "plate":
@@ -728,7 +732,9 @@ def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str) -> bool:
             return False
         return True
     except Exception as e:
-        print(f"[ML-Pipeline] Imajev validation failed: {e}. Falling back to standard.")
+        print(f"[ML-Pipeline] Imajev validation failed: {e}. Falling back to safe handling.")
+        if entity_type == "plate" and initial_score is not None and initial_score < 0.60:
+            return False
         return True
 
 
@@ -736,11 +742,13 @@ def analyze_image_entities(
     image_input: Union[str, Path, np.ndarray, bytes], 
     conf_threshold: float = 0.40,
     ocr_engine: str = 'easyocr',
-    layout_engine: str = 'regex'
+    layout_engine: str = 'regex',
+    use_imajev: bool = False
 ) -> Dict[str, Any]:
     """
     Analyzes an input image to detect sensitive entities.
-    Now supports modular dynamic routing based on requested OCR and Layout engines.
+    Now supports modular dynamic routing based on requested OCR and Layout engines,
+    and optional Imajev VLM reasoning and crop validation.
     """
     image = _load_image(image_input)
     if image.ndim == 2:
@@ -750,30 +758,41 @@ def analyze_image_entities(
     height, width = image.shape[:2]
 
     detections: List[Dict[str, Any]] = []
+    imajev_logs: List[str] = []
 
     skip_ocr = False
-    if HAS_IMAJEV:
-        try:
-            vlm = _model_manager.imajev_model
-            if vlm:
-                prompt = "Classify this image: 1. Document/Form/ID/Text, 2. Street/Landscape/People. Answer with 1 or 2."
-                if hasattr(vlm, 'generate'):
-                    resp = vlm.generate(image, prompt)
-                elif hasattr(vlm, '__call__'):
-                    resp = vlm(image, prompt)
-                elif hasattr(vlm, 'predict'):
-                    resp = vlm.predict(image, prompt)
-                else:
-                    resp = ""
-                resp_text = str(resp).lower()
-                
-                if "street" in resp_text or "landscape" in resp_text or "people" in resp_text or "2" in resp_text:
-                    skip_ocr = True
-                    print("[ML-Pipeline] Imajev routed image as Street/Landscape/People. Skipping OCR.")
-                else:
-                    print("[ML-Pipeline] Imajev routed image as Document")
-        except Exception as e:
-            print(f"[ML-Pipeline] Imajev routing failed: {e}. Falling back to standard processing.")
+    if use_imajev:
+        imajev_logs.append("🚀 مدل استدلالگر هوشمند Imajev VLM فعال شد.")
+        if HAS_IMAJEV:
+            try:
+                vlm = _model_manager.imajev_model
+                if vlm:
+                    prompt = "Classify this image: 1. Document/Form/ID/Text, 2. Street/Landscape/People. Answer with 1 or 2."
+                    if hasattr(vlm, 'generate'):
+                        resp = vlm.generate(image, prompt)
+                    elif hasattr(vlm, '__call__'):
+                        resp = vlm(image, prompt)
+                    elif hasattr(vlm, 'predict'):
+                        resp = vlm.predict(image, prompt)
+                    else:
+                        resp = ""
+                    resp_text = str(resp).lower()
+                    
+                    if "street" in resp_text or "landscape" in resp_text or "people" in resp_text or "2" in resp_text:
+                        skip_ocr = True
+                        log_msg = "⚡ Imajev: تصویر به عنوان 'فضای باز / عمومی' طبقه‌بندی شد (پردازش سنگین OCR لغو شد)"
+                        imajev_logs.append(log_msg)
+                        print(f"[ML-Pipeline] {log_msg}")
+                    else:
+                        log_msg = "🔍 Imajev: تصویر به عنوان 'سند / متن' طبقه‌بندی شد (پردازش OCR فعال است)"
+                        imajev_logs.append(log_msg)
+                        print(f"[ML-Pipeline] {log_msg}")
+            except Exception as e:
+                err_msg = f"⚠️ Imajev: خطا در مسیریابی هوشمند ({e})، استفاده از روال استاندارد"
+                imajev_logs.append(err_msg)
+                print(f"[ML-Pipeline] {err_msg}")
+        else:
+            imajev_logs.append("⚠️ ماژول Imajev روی سیستم بارگذاری نشد؛ پردازش به صورت استاندارد انجام می‌شود.")
 
     # 1. Faces -------------------------------------------------------------- #
     try:
@@ -797,10 +816,14 @@ def analyze_image_entities(
                     if bx[2] - bx[0] < 2 or bx[3] - bx[1] < 2:
                         continue
                         
-                    if score < 0.60:
+                    if use_imajev and score < 0.60:
                         crop = image[bx[1]:bx[3], bx[0]:bx[2]]
-                        if crop.size > 0 and not _validate_crop_with_imajev(crop, "face"):
-                            continue
+                        if crop.size > 0:
+                            if not _validate_crop_with_imajev(crop, "face", initial_score=score):
+                                imajev_logs.append(f"❌ Imajev: کادر چهره با اطمینان مرزی ({score:.2f}) تایید نشد و حذف شد")
+                                continue
+                            else:
+                                imajev_logs.append(f"✅ Imajev: کادر چهره با اطمینان ({score:.2f}) توسط مدل تایید شد")
 
                     detections.append({
                         "type": "face",
@@ -815,7 +838,7 @@ def analyze_image_entities(
     try:
         plate_model = _model_manager.plate_model
         if plate_model is not None:
-            plate_conf = min(conf_threshold, 0.35) if conf_threshold > 0.35 else max(conf_threshold, PLATE_MIN_CONFIDENCE)
+            plate_conf = max(conf_threshold, PLATE_MIN_CONFIDENCE)
             longest_dim = max(width, height)
             yolo_imgsz = 1280 if longest_dim >= 600 else 640
             for r in plate_model.predict(source=image, conf=plate_conf, imgsz=yolo_imgsz, iou=0.45, verbose=False):
@@ -834,14 +857,20 @@ def analyze_image_entities(
 
                     if score < PLATE_CASCADE_BELOW:
                         crop = image[bx[1]:bx[3], bx[0]:bx[2]]
-                        if crop.size > 0 and not _validate_crop_with_imajev(crop, "plate"):
-                            continue
+                        if crop.size > 0 and use_imajev:
+                            if not _validate_crop_with_imajev(crop, "plate", initial_score=score):
+                                imajev_logs.append(f"❌ Imajev: کادر پلاک با اطمینان مرزی ({score:.2f}) تایید نشد و حذف شد")
+                                continue
+                            else:
+                                imajev_logs.append(f"✅ Imajev: کادر پلاک با اطمینان ({score:.2f}) توسط مدل تایید شد")
                         if crop.shape[0] < 32:
                             scale = 32.0 / crop.shape[0]
                             crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
                         plate_ocr = _model_manager.ocr_reader.readtext(crop, detail=1, paragraph=False)
                         plate_text = "".join(str(item[1]) for item in plate_ocr)
                         if not _plate_text_is_valid(plate_text):
+                            if use_imajev:
+                                imajev_logs.append("❌ Imajev/OCR: کاراکترهای پلاک با الگوی معتبر همخوانی نداشت و حذف شد")
                             continue
 
                     detections.append({
@@ -911,11 +940,15 @@ def analyze_image_entities(
                 continue
             
             score = d.get("score", 1.0)
-            if score < 0.5:
+            if use_imajev and score < 0.5:
                 bx = d["bbox"]
                 crop = image[max(0, int(bx[1])):min(height, int(bx[3])), max(0, int(bx[0])):min(width, int(bx[2]))]
-                if crop.size > 0 and not _validate_crop_with_imajev(crop, "text"):
-                    continue
+                if crop.size > 0:
+                    if not _validate_crop_with_imajev(crop, "text", initial_score=score):
+                        imajev_logs.append(f"❌ Imajev: قطعه متن مشکوک '{d.get('text', '')[:12]}' حذف شد")
+                        continue
+                    else:
+                        imajev_logs.append(f"✅ Imajev: قطعه متن '{d.get('text', '')[:12]}' تایید شد")
                     
             detections.append(d)
     except ValueError as ve:
@@ -923,6 +956,9 @@ def analyze_image_entities(
     except Exception as e:
         print(f"[ML-Pipeline] Text OCR detection warning: {e}")
         # Allow other engines to fail gracefully unless it's a direct ValueError from our strict handling
+
+    if use_imajev and len(imajev_logs) == 1:
+        imajev_logs.append("✨ Imajev: همه عناصر شناسایی‌شده دارای ضریب اطمینان بالا بودند و نیازی به فیلتر ثانویه نبود.")
 
     for i, d in enumerate(detections, start=1):
         d["id"] = i
@@ -933,7 +969,8 @@ def analyze_image_entities(
             "width": int(width),
             "height": int(height)
         },
-        "detections": detections
+        "detections": detections,
+        "imajev_logs": imajev_logs
     }
 
 

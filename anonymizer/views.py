@@ -83,13 +83,15 @@ def analyze_image_api(request):
 
         ocr_engine = request.POST.get('ocr_engine', 'easyocr')
         layout_engine = request.POST.get('layout_engine', 'regex')
+        use_imajev = request.POST.get('use_imajev', 'false').lower() in ('true', '1', 'yes')
 
         # Run AI entity detection pipeline
         analysis_result = analyze_image_entities(
             file_bytes, 
             conf_threshold=conf_threshold,
             ocr_engine=ocr_engine,
-            layout_engine=layout_engine
+            layout_engine=layout_engine,
+            use_imajev=use_imajev
         )
 
         return JsonResponse(analysis_result, status=200)

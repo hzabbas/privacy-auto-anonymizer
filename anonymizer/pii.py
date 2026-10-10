@@ -694,7 +694,8 @@ class NERRecognizer:
             for r in results:
                 group = r.get("entity_group", "")
                 score = float(r.get("score", 0.0))
-                if group not in ("PER", "LOC"):
+                # Only keep PERSON; ignore LOCATION (e.g. USA, Canada) to prevent false positives
+                if group != "PER":
                     continue
                 s, e = int(r["start"]) + offset, int(r["end"]) + offset
                 surface = text[s:e].strip()
@@ -702,15 +703,10 @@ class NERRecognizer:
                     continue
                 if surface.lower().strip(".,:") in _NER_STOPWORDS:
                     continue
-                if group == "PER":
-                    # Names are capitalised in typed documents; this rejects OCR junk.
-                    if score < min_score or not surface[0].isupper():
-                        continue
-                    spans.append(PIISpan(s, e, "PERSON", round(score, 2), "ner"))
-                else:
-                    if score < max(min_score, 0.85) or not surface[0].isupper():
-                        continue
-                    spans.append(PIISpan(s, e, "LOCATION", round(score, 2), "ner"))
+                # Names are capitalised in typed documents; this rejects OCR junk.
+                if score < min_score or not surface[0].isupper():
+                    continue
+                spans.append(PIISpan(s, e, "PERSON", round(score, 2), "ner"))
         return spans
 
 
@@ -734,9 +730,11 @@ def _merge(spans: List[PIISpan], text: str) -> List[PIISpan]:
         else:
             merged.append(sp)
 
-    # Trim whitespace / trailing punctuation from span edges.
+    # Trim whitespace / trailing punctuation from span edges and drop any LOCATION entities.
     cleaned = []
     for sp in merged:
+        if sp.entity == "LOCATION":
+            continue
         s, e = sp.start, sp.end
         while s < e and text[s] in " \t\n,;:":
             s += 1

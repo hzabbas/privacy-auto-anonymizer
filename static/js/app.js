@@ -115,6 +115,7 @@ class AnonymizerStudio {
         // Engine select change listeners for Auto-Reanalyze
         const ocrSelect = document.getElementById('ocrEngineSelect');
         const layoutSelect = document.getElementById('layoutEngineSelect');
+        const imajevToggle = document.getElementById('imajevToggle');
         const reanalyzeHandler = () => {
             if (this.currentFile) {
                 this.analyzeImage(this.currentFile);
@@ -122,6 +123,25 @@ class AnonymizerStudio {
         };
         if (ocrSelect) ocrSelect.addEventListener('change', reanalyzeHandler);
         if (layoutSelect) layoutSelect.addEventListener('change', reanalyzeHandler);
+
+        if (imajevToggle) {
+            imajevToggle.addEventListener('change', (e) => {
+                this.handleImajevToggle(e.target.checked);
+                reanalyzeHandler();
+            });
+        }
+
+        const btnClearLogs = document.getElementById('btnClearImajevLogs');
+        if (btnClearLogs) {
+            btnClearLogs.addEventListener('click', () => {
+                const content = document.getElementById('imajevLogContent');
+                const countBadge = document.getElementById('imajevLogCount');
+                if (content) {
+                    content.innerHTML = `<div class="text-zinc-500 text-[11px] italic p-2.5 bg-zinc-900/30 rounded-lg border border-zinc-800/40">لاگ‌ها پاکسازی شدند.</div>`;
+                }
+                if (countBadge) countBadge.textContent = '0 رویداد';
+            });
+        }
 
         // Canvas Click & Hover for Hit Testing (Human-in-the-loop)
         this.canvas.addEventListener('click', (e) => this.handleCanvasClick(e));
@@ -367,6 +387,27 @@ class AnonymizerStudio {
             formData.append('ocr_engine', ocrEngine);
             formData.append('layout_engine', layoutEngine);
 
+            const imajevToggle = document.getElementById('imajevToggle');
+            const useImajev = imajevToggle ? imajevToggle.checked : false;
+            formData.append('use_imajev', useImajev ? 'true' : 'false');
+
+            if (useImajev) {
+                const statusText = document.getElementById('imajevStatusText');
+                const statusPulse = document.getElementById('imajevStatusPulse');
+                if (statusText) statusText.textContent = 'در حال استدلال...';
+                if (statusPulse) {
+                    statusPulse.classList.remove('bg-emerald-400');
+                    statusPulse.classList.add('bg-cyan-400');
+                }
+                const container = document.getElementById('imajevLogContent');
+                if (container) {
+                    container.innerHTML = `<div class="text-cyan-400 text-[11px] font-mono flex items-center gap-2 p-2.5 bg-zinc-900/50 rounded-lg border border-zinc-800/60 animate-pulse">
+                        <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
+                        در حال ارسال تصویر و اجرای استدلال معنایی توسط Imajev VLM...
+                    </div>`;
+                }
+            }
+
             const response = await fetch('/api/analyze/', {
                 method: 'POST',
                 body: formData
@@ -384,6 +425,14 @@ class AnonymizerStudio {
                     ...det,
                     isMasked: false
                 }));
+
+                // Handle Imajev logs display
+                if (useImajev && Array.isArray(data.imajev_logs)) {
+                    this.renderImajevLogs(data.imajev_logs);
+                } else if (!useImajev) {
+                    const statusText = document.getElementById('imajevStatusText');
+                    if (statusText) statusText.textContent = 'غیرفعال';
+                }
 
                 // Enable toolbar controls
                 this.enableControls(true);
@@ -1126,6 +1175,125 @@ class AnonymizerStudio {
             toast.classList.add('opacity-0', 'translate-y-2');
             setTimeout(() => toast.remove(), 300);
         }, 3500);
+    }
+
+    /**
+     * Toggles 2-column responsive layout shift when Imajev is enabled/disabled.
+     */
+    handleImajevToggle(isActive) {
+        const workspaceGrid = document.getElementById('workspaceGrid');
+        const dropzoneContainer = document.getElementById('dropzoneContainer');
+        const logPanel = document.getElementById('imajevLogPanel');
+        const mainWorkspace = document.getElementById('mainWorkspace');
+
+        if (isActive) {
+            if (workspaceGrid) {
+                workspaceGrid.classList.remove('grid-cols-1');
+                workspaceGrid.classList.add('grid-cols-1', 'lg:grid-cols-4');
+            }
+            if (dropzoneContainer) {
+                dropzoneContainer.classList.add('lg:col-span-3');
+            }
+            if (logPanel) {
+                logPanel.classList.remove('hidden');
+                logPanel.classList.add('flex', 'lg:col-span-1');
+            }
+            if (mainWorkspace) {
+                mainWorkspace.classList.remove('max-w-6xl');
+                mainWorkspace.classList.add('max-w-7xl');
+            }
+            this.showToast('حالت استدلال هوشمند Imajev فعال شد.');
+        } else {
+            if (workspaceGrid) {
+                workspaceGrid.classList.remove('lg:grid-cols-4');
+                workspaceGrid.classList.add('grid-cols-1');
+            }
+            if (dropzoneContainer) {
+                dropzoneContainer.classList.remove('lg:col-span-3');
+            }
+            if (logPanel) {
+                logPanel.classList.remove('flex', 'lg:col-span-1');
+                logPanel.classList.add('hidden');
+            }
+            if (mainWorkspace) {
+                mainWorkspace.classList.remove('max-w-7xl');
+                mainWorkspace.classList.add('max-w-6xl');
+            }
+        }
+
+        // Allow layout animation to settle and refresh canvas HUD alignment
+        setTimeout(() => {
+            if (this.originalImage) {
+                this.render();
+            }
+        }, 150);
+    }
+
+    /**
+     * Renders Imajev reasoning decisions with staggered fade-in animation.
+     */
+    renderImajevLogs(logs) {
+        const container = document.getElementById('imajevLogContent');
+        const countBadge = document.getElementById('imajevLogCount');
+        const statusText = document.getElementById('imajevStatusText');
+        const statusPulse = document.getElementById('imajevStatusPulse');
+        if (!container) return;
+
+        container.innerHTML = '';
+        if (countBadge) countBadge.textContent = `${logs.length} رویداد`;
+        if (statusText) statusText.textContent = 'تکمیل شد';
+        if (statusPulse) {
+            statusPulse.classList.remove('bg-cyan-400');
+            statusPulse.classList.add('bg-emerald-400');
+        }
+
+        if (!logs || logs.length === 0) {
+            container.innerHTML = `<div class="text-zinc-500 text-[11px] italic p-2.5 bg-zinc-900/30 rounded-lg border border-zinc-800/40">هیچ تصمیمی توسط Imajev برای این تصویر ثبت نشد.</div>`;
+            return;
+        }
+
+        logs.forEach((logText, index) => {
+            const item = document.createElement('div');
+            item.className = 'flex items-start gap-2 p-2 rounded-lg bg-zinc-900/70 border border-zinc-800/60 text-zinc-300 text-[11px] leading-relaxed transition-all duration-300 opacity-0 translate-y-2';
+
+            let dotColor = 'bg-cyan-400';
+            if (logText.includes('❌')) dotColor = 'bg-rose-500';
+            else if (logText.includes('✅')) dotColor = 'bg-emerald-400';
+            else if (logText.includes('⚡')) dotColor = 'bg-amber-400';
+            else if (logText.includes('⚠️')) dotColor = 'bg-orange-500';
+            else if (logText.includes('🚀')) dotColor = 'bg-cyan-400';
+
+            const cleanText = logText
+                .replace(/^(\s*[❌✅⚡⚠️🔍🚀✨]\s*Imajev(?:\/OCR)?:\s*)/, '')
+                .trim();
+            const prefixMatch = logText.match(/^(\s*[❌✅⚡⚠️🔍🚀✨]\s*Imajev(?:\/OCR)?)/);
+            const prefix = prefixMatch ? prefixMatch[1] : 'Imajev';
+
+            item.innerHTML = `
+                <span class="inline-block w-1.5 h-1.5 rounded-full ${dotColor} mt-1.5 flex-shrink-0 shadow-[0_0_6px_currentColor]"></span>
+                <div class="flex-1">
+                    <span class="font-bold text-zinc-200">${this.escapeHtml(prefix)}:</span>
+                    <span class="text-zinc-300">${this.escapeHtml(cleanText)}</span>
+                </div>
+            `;
+            container.appendChild(item);
+
+            setTimeout(() => {
+                item.classList.remove('opacity-0', 'translate-y-2');
+                item.classList.add('opacity-100', 'translate-y-0');
+                container.scrollTop = container.scrollHeight;
+            }, index * 90);
+        });
+    }
+
+    escapeHtml(str) {
+        if (!str) return '';
+        return str
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
     }
 }
 
