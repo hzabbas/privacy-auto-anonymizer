@@ -11,13 +11,19 @@ import math
 import warnings
 warnings.filterwarnings("ignore")
 
+try:
+    import imajev
+    HAS_IMAJEV = True
+except ImportError:
+    HAS_IMAJEV = False
+
 from . import pii
 
 # Tunable thresholds -------------------------------------------------------- #
 # Plate detector is noisy on documents (it fires on printed words), so it uses a
 # stricter floor and OCR verification below PLATE_CASCADE_BELOW.
-PLATE_MIN_CONFIDENCE = 0.45
-PLATE_CASCADE_BELOW = 0.85
+PLATE_MIN_CONFIDENCE = 0.25
+PLATE_CASCADE_BELOW = 0.60
 # YOLOv8-face boxes are tight; expand each side by this ratio before masking.
 FACE_EXPAND_RATIO = 0.10
 # OCR words below this recognition confidence are treated as noise.
@@ -159,6 +165,28 @@ class ModelManager:
 
 
     @property
+    def imajev_model(self):
+        if not hasattr(self, '_imajev_model'):
+            self._imajev_model = None
+        if self._imajev_model is None and HAS_IMAJEV:
+            with self._lock:
+                if self._imajev_model is None:
+                    try:
+                        if hasattr(imajev, 'ImajevModel'):
+                            self._imajev_model = imajev.ImajevModel()
+                        elif hasattr(imajev, 'load_model'):
+                            self._imajev_model = imajev.load_model()
+                        elif hasattr(imajev, 'pipeline'):
+                            self._imajev_model = imajev.pipeline()
+                        else:
+                            self._imajev_model = imajev
+                        print("[ML-Pipeline] Loaded imajev VLM.")
+                    except Exception as e:
+                        print(f"[ML-Pipeline] Warning: Failed to initialize imajev ({e}).")
+                        self._imajev_model = None
+        return self._imajev_model
+
+    @property
     def paddle_ocr_reader(self):
         if not hasattr(self, '_paddle_ocr_reader'):
             self._paddle_ocr_reader = None
@@ -166,11 +194,27 @@ class ModelManager:
             with self._lock:
                 if self._paddle_ocr_reader is None:
                     try:
+                        import inspect
                         from paddleocr import PaddleOCR
-                        self._paddle_ocr_reader = PaddleOCR(use_angle_cls=True, lang='en')
+                        
+                        paddle_kwargs = {
+                            'use_textline_orientation': False,
+                            'lang': 'en',
+                            'enable_mkldnn': False,
+                        }
+                        sig = inspect.signature(PaddleOCR.__init__)
+                        if 'use_doc_orientation_classify' in sig.parameters:
+                            paddle_kwargs['use_doc_orientation_classify'] = False
+                        if 'use_doc_unwarping' in sig.parameters:
+                            paddle_kwargs['use_doc_unwarping'] = False
+
+                        self._paddle_ocr_reader = PaddleOCR(**paddle_kwargs)
                         print("[ML-Pipeline] Loaded PaddleOCR (Persian/English).")
                     except ImportError:
                         print("[ML-Pipeline] Warning: PaddleOCR not installed.")
+                        self._paddle_ocr_reader = None
+                    except Exception as e:
+                        print(f"[ML-Pipeline] Warning: Failed to initialize PaddleOCR ({e}).")
                         self._paddle_ocr_reader = None
         return self._paddle_ocr_reader
 
@@ -183,7 +227,7 @@ class ModelManager:
                 if self._doctr_reader is None:
                     try:
                         from doctr.models import ocr_predictor
-                        self._doctr_reader = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
+                        self._doctr_reader = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True, assume_straight_pages=True)
                         print("[ML-Pipeline] Loaded DocTR. Note: Standard DocTR weights are Latin-only. Persian/Arabic text may not be recognized.")
                     except ImportError:
                         print("[ML-Pipeline] Warning: DocTR not installed.")
@@ -263,13 +307,27 @@ def _iou(a: List[int], b: List[int]) -> float:
 
 def _plate_text_is_valid(text: str) -> bool:
     """
-    Real licence plates (US/EU/UK/...) contain at least one digit and 4-10
-    alphanumerics. This rejects the classic false positive of the plate detector
-    firing on a printed word or name (e.g. "Anthony Caldwell" in a letter).
+    Real licence plates (US/EU/UK/Iran/...) contain alphanumeric characters,
+    often with digits or uppercase letters (e.g. 'B 11 HOY', '21B34522').
+    This rejects the classic false positive of the plate detector
+    firing on printed words or names in text documents (e.g. 'Anthony Caldwell').
     """
+    if not text.strip():
+        # If crop is too blurry or distant for OCR to read, do not discard a detected vehicle plate
+        return True
     alnum = re.sub(r"[^A-Za-z0-9\u0660-\u0669\u06F0-\u06F9\u0600-\u06FF]", "", text)
-    has_digit = any(c.isdigit() for c in alnum)
-    return has_digit and 4 <= len(alnum) <= 12
+    if len(alnum) < 2 or len(alnum) > 14:
+        return False
+    # If it has digits, it's valid
+    if any(c.isdigit() for c in alnum):
+        return True
+    # If it has uppercase characters and OCR digit confusions ('I', 'L', 'O')
+    if alnum.isupper() and any(c in "ILO10" for c in alnum):
+        return True
+    # If all uppercase and short (typical plate format)
+    if alnum.isupper() and 3 <= len(alnum) <= 8:
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -280,7 +338,8 @@ class _OCRBox:
     __slots__ = ("pts", "text", "conf", "cx", "cy", "h", "x1", "x2", "y1", "y2", "start", "end")
 
     def __init__(self, bbox, text: str, conf: float):
-        self.pts = [[float(p[0]), float(p[1])] for p in bbox]
+        raw_pts = [[float(p[0]), float(p[1])] for p in bbox]
+        self.pts = raw_pts
         self.text = text
         self.conf = conf
         xs = [p[0] for p in self.pts]
@@ -335,7 +394,7 @@ def _sub_polygon(box: _OCRBox, a: int, b: int) -> List[List[float]]:
     so that proportional-font glyphs are never left partially visible.
     """
     n = max(1, len(box.text))
-    pad = 0.5
+    pad = 0.05
     fa = max(0.0, (a - pad) / n)
     fb = min(1.0, (b + pad) / n)
     p0, p1, p2, p3 = box.pts
@@ -402,7 +461,7 @@ def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> Lis
             left = _sub_polygon(first, max(0, span.start - first.start), first.end - first.start)
             right = _sub_polygon(last, 0, min(span.end, last.end) - last.start)
             poly = [left[0], right[1], right[2], left[3]]
-            poly = _expand_polygon(poly, ratio_h=0.08, ratio_w=0.01)
+            poly = _expand_polygon(poly, ratio_h=0.02, ratio_w=0.005)
             polygon = [[_clamp(int(round(x)), 0, width), _clamp(int(round(y)), 0, height)] for x, y in poly]
             
             if M_inv is not None:
@@ -558,35 +617,38 @@ def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int, is_crop:
         print("[ML-Pipeline] PaddleOCR unavailable, falling back to EasyOCR.")
         return _run_easyocr_pipeline(image, width, height, is_crop)
     
-    if is_crop:
-        results = paddle.ocr(image, cls=True)
-        ocr_results = []
-        if results and results[0]:
+    def _parse_paddle_results(results):
+        parsed = []
+        if not results or not results[0]:
+            return parsed
+        if isinstance(results[0], dict):
+            for res_dict in results:
+                if 'rec_texts' in res_dict and 'rec_polys' in res_dict and 'rec_scores' in res_dict:
+                    for text, box, score in zip(res_dict['rec_texts'], res_dict['rec_polys'], res_dict['rec_scores']):
+                        text_str = str(text).strip()
+                        if text_str:
+                            box_list = box.tolist() if hasattr(box, 'tolist') else box
+                            parsed.append((box_list, text_str, float(score)))
+        elif isinstance(results[0], list):
             for line in results[0]:
-                bbox, (text, conf) = line
-                ocr_results.append((bbox, text, conf))
-        return _ocr_pii_detections(ocr_results, width, height)
-        
-    ocr_image, mrz_crop, y_offset, M_inv = preprocess_for_ocr(image)
-    
-    # Run on main image
-    results = paddle.ocr(ocr_image, cls=True)
-    ocr_results = []
-    if results and results[0]:
-        for line in results[0]:
-            bbox, (text, conf) = line
-            ocr_results.append((bbox, text, conf))
-            
-    # Run on MRZ crop if available
-    if mrz_crop is not None and mrz_crop.size > 0:
-        mrz_results = paddle.ocr(mrz_crop, cls=True)
-        if mrz_results and mrz_results[0]:
-            for line in mrz_results[0]:
-                bbox, (text, conf) = line
-                shifted_bbox = [[p[0], p[1] + y_offset] for p in bbox]
-                ocr_results.append((shifted_bbox, text, conf))
-                
-    return _ocr_pii_detections(ocr_results, width, height, M_inv)
+                if len(line) == 2:
+                    bbox, (text, conf) = line
+                    text_str = str(text).strip()
+                    if text_str:
+                        bbox_list = bbox.tolist() if hasattr(bbox, 'tolist') else bbox
+                        parsed.append((bbox_list, text_str, float(conf)))
+        return parsed
+
+    def _ensure_3channel(img):
+        if len(img.shape) == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif len(img.shape) == 3 and img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return img
+
+    results = paddle.ocr(_ensure_3channel(image))
+    ocr_results = _parse_paddle_results(results)
+    return _ocr_pii_detections(ocr_results, width, height)
 
 
 def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
@@ -598,16 +660,13 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
     from doctr.io import DocumentFile
     
     def _run_doctr_on_img(img_array):
-        if len(img_array.shape) == 2:
-            rgb_img = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
-        else:
-            rgb_img = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
-            
-        doc = DocumentFile.from_images([rgb_img])
+        _, encoded_image = cv2.imencode('.png', img_array)
+        doc = DocumentFile.from_images([encoded_image.tobytes()])
         result = doctr(doc)
         res_list = []
         img_h, img_w = img_array.shape[:2]
         for page in result.pages:
+            page_h, page_w = page.dimensions
             for block in page.blocks:
                 for line in block.lines:
                     text = " ".join(word.value for word in line.words)
@@ -619,7 +678,7 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
                     conf = sum(word.confidence for word in line.words) / len(line.words)
                     xmin, ymin = line.geometry[0]
                     xmax, ymax = line.geometry[1]
-                    bbox = [[xmin*img_w, ymin*img_h], [xmax*img_w, ymin*img_h], [xmax*img_w, ymax*img_h], [xmin*img_w, ymax*img_h]]
+                    bbox = [[xmin*page_w, ymin*page_h], [xmax*page_w, ymin*page_h], [xmax*page_w, ymax*page_h], [xmin*page_w, ymax*page_h]]
                     res_list.append((bbox, text, conf))
         return res_list
         
@@ -638,6 +697,39 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
             ocr_results.append((shifted_bbox, text, conf))
 
     return _ocr_pii_detections(ocr_results, width, height, M_inv)
+
+
+def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str) -> bool:
+    if not HAS_IMAJEV:
+        return True
+    try:
+        vlm = _model_manager.imajev_model
+        if not vlm:
+            return True
+            
+        if entity_type == "plate":
+            prompt = "Is this a clear, valid license plate? Answer YES or NO."
+        elif entity_type == "face":
+            prompt = "Is this a clear, valid human face? Answer YES or NO."
+        else:
+            prompt = "Is this a valid identification text? Answer YES or NO."
+            
+        if hasattr(vlm, 'generate'):
+            resp = vlm.generate(crop_img, prompt)
+        elif hasattr(vlm, '__call__'):
+            resp = vlm(crop_img, prompt)
+        elif hasattr(vlm, 'predict'):
+            resp = vlm.predict(crop_img, prompt)
+        else:
+            resp = "yes"
+            
+        resp_text = str(resp).lower()
+        if "no" in resp_text or "false" in resp_text or "negative" in resp_text:
+            return False
+        return True
+    except Exception as e:
+        print(f"[ML-Pipeline] Imajev validation failed: {e}. Falling back to standard.")
+        return True
 
 
 def analyze_image_entities(
@@ -659,11 +751,37 @@ def analyze_image_entities(
 
     detections: List[Dict[str, Any]] = []
 
+    skip_ocr = False
+    if HAS_IMAJEV:
+        try:
+            vlm = _model_manager.imajev_model
+            if vlm:
+                prompt = "Classify this image: 1. Document/Form/ID/Text, 2. Street/Landscape/People. Answer with 1 or 2."
+                if hasattr(vlm, 'generate'):
+                    resp = vlm.generate(image, prompt)
+                elif hasattr(vlm, '__call__'):
+                    resp = vlm(image, prompt)
+                elif hasattr(vlm, 'predict'):
+                    resp = vlm.predict(image, prompt)
+                else:
+                    resp = ""
+                resp_text = str(resp).lower()
+                
+                if "street" in resp_text or "landscape" in resp_text or "people" in resp_text or "2" in resp_text:
+                    skip_ocr = True
+                    print("[ML-Pipeline] Imajev routed image as Street/Landscape/People. Skipping OCR.")
+                else:
+                    print("[ML-Pipeline] Imajev routed image as Document")
+        except Exception as e:
+            print(f"[ML-Pipeline] Imajev routing failed: {e}. Falling back to standard processing.")
+
     # 1. Faces -------------------------------------------------------------- #
     try:
         face_model = _model_manager.face_model
         if face_model is not None:
-            for r in face_model.predict(source=image, conf=conf_threshold, verbose=False):
+            longest_dim = max(width, height)
+            yolo_imgsz = 1280 if longest_dim >= 960 else 640
+            for r in face_model.predict(source=image, conf=conf_threshold, imgsz=yolo_imgsz, verbose=False):
                 for box in r.boxes:
                     score = float(box.conf[0].item())
                     if score < conf_threshold:
@@ -678,6 +796,12 @@ def analyze_image_entities(
                           _clamp(int(math.ceil(x2)), 0, width), _clamp(int(math.ceil(y2)), 0, height)]
                     if bx[2] - bx[0] < 2 or bx[3] - bx[1] < 2:
                         continue
+                        
+                    if score < 0.60:
+                        crop = image[bx[1]:bx[3], bx[0]:bx[2]]
+                        if crop.size > 0 and not _validate_crop_with_imajev(crop, "face"):
+                            continue
+
                     detections.append({
                         "type": "face",
                         "bbox": bx,
@@ -691,8 +815,10 @@ def analyze_image_entities(
     try:
         plate_model = _model_manager.plate_model
         if plate_model is not None:
-            plate_conf = max(conf_threshold, PLATE_MIN_CONFIDENCE)
-            for r in plate_model.predict(source=image, conf=plate_conf, verbose=False):
+            plate_conf = min(conf_threshold, 0.35) if conf_threshold > 0.35 else max(conf_threshold, PLATE_MIN_CONFIDENCE)
+            longest_dim = max(width, height)
+            yolo_imgsz = 1280 if longest_dim >= 600 else 640
+            for r in plate_model.predict(source=image, conf=plate_conf, imgsz=yolo_imgsz, iou=0.45, verbose=False):
                 for box in r.boxes:
                     score = float(box.conf[0].item())
                     if score < plate_conf:
@@ -708,6 +834,8 @@ def analyze_image_entities(
 
                     if score < PLATE_CASCADE_BELOW:
                         crop = image[bx[1]:bx[3], bx[0]:bx[2]]
+                        if crop.size > 0 and not _validate_crop_with_imajev(crop, "plate"):
+                            continue
                         if crop.shape[0] < 32:
                             scale = 32.0 / crop.shape[0]
                             crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -728,7 +856,7 @@ def analyze_image_entities(
     # 3. Dynamic OCR & Layout strategy -------------------------------------- #
     try:
         lp_blocks = []
-        if layout_engine == 'layoutparser':
+        if not skip_ocr and layout_engine == 'layoutparser':
             lp_model = _model_manager.layout_parser
             if lp_model is None:
                 print("[ML-Pipeline] LayoutParser not available, falling back to regex.")
@@ -742,7 +870,9 @@ def analyze_image_entities(
                         lp_blocks.append([int(x1), int(y1), int(x2), int(y2)])
 
         text_dets = []
-        if layout_engine == 'layoutparser' and lp_blocks:
+        if skip_ocr:
+            pass
+        elif layout_engine == 'layoutparser' and lp_blocks:
             # Run OCR ONLY on detected layout blocks
             for block in lp_blocks:
                 bx1, by1, bx2, by2 = block
@@ -779,6 +909,14 @@ def analyze_image_entities(
         for d in text_dets:
             if any(_iou(d["bbox"], p) > 0.5 for p in plates):
                 continue
+            
+            score = d.get("score", 1.0)
+            if score < 0.5:
+                bx = d["bbox"]
+                crop = image[max(0, int(bx[1])):min(height, int(bx[3])), max(0, int(bx[0])):min(width, int(bx[2]))]
+                if crop.size > 0 and not _validate_crop_with_imajev(crop, "text"):
+                    continue
+                    
             detections.append(d)
     except ValueError as ve:
         raise ve
