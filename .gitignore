@@ -44,6 +44,7 @@ weights/
 runs/
 .easyocr/
 models/*.pt
+imajev/
 
 # Environment & Secrets
 .env
