@@ -959,20 +959,66 @@ class AnonymizerStudio {
             // Strict Y clamping: ensure labels never exceed canvas bottom
             const clampedY = Math.min(targetY, canvasH - 35);
 
-            // Connector Geometry:
-            // Lines extend completely outside the canvas bounds
+            // Adaptive Positioning: check space between canvas and dropzoneContainer bounds
+            const dropzoneRect = this.dropzone ? this.dropzone.getBoundingClientRect() : rect;
+            const spaceLeft = rect.left - dropzoneRect.left;
+            const spaceRight = dropzoneRect.right - rect.right;
+            const BADGE_WIDTH = 120;
+            const SAFE_PAD = 15;
+            const NEEDED_SPACE = BADGE_WIDTH + SAFE_PAD; // 135px
+
+            const canFitOutsideLeft = spaceLeft >= NEEDED_SPACE;
+            const canFitOutsideRight = spaceRight >= NEEDED_SPACE;
+
+            // Connector & Badge Geometry:
             let p0, p1, p2, p3;
+            let badgeLeft;
 
             if (direction === 'right') {
-                p0 = { x: sx2, y: boxCenterY };
-                p1 = { x: sx2 + 10, y: boxCenterY };
-                p2 = { x: rect.width + 8, y: clampedY };
-                p3 = { x: rect.width + 20, y: clampedY };
+                if (canFitOutsideRight) {
+                    p0 = { x: sx2, y: boxCenterY };
+                    p1 = { x: sx2 + 10, y: boxCenterY };
+                    p2 = { x: rect.width + 8, y: clampedY };
+                    p3 = { x: rect.width + 18, y: clampedY };
+                    badgeLeft = `${(rect.width + 18).toFixed(1)}px`;
+                } else if (canFitOutsideLeft) {
+                    p0 = { x: sx1, y: boxCenterY };
+                    p1 = { x: sx1 - 10, y: boxCenterY };
+                    p2 = { x: -8, y: clampedY };
+                    p3 = { x: -18, y: clampedY };
+                    badgeLeft = `${(-BADGE_WIDTH - 18).toFixed(1)}px`;
+                } else {
+                    // Dock inside canvas right edge
+                    const targetX = rect.width - BADGE_WIDTH - 12;
+                    p0 = { x: sx2, y: boxCenterY };
+                    p1 = { x: Math.min(targetX - 8, (sx2 + targetX) / 2), y: boxCenterY };
+                    p2 = { x: targetX - 6, y: clampedY };
+                    p3 = { x: targetX - 2, y: clampedY };
+                    badgeLeft = `${targetX.toFixed(1)}px`;
+                }
             } else {
-                p0 = { x: sx1, y: boxCenterY };
-                p1 = { x: sx1 - 10, y: boxCenterY };
-                p2 = { x: -8, y: clampedY };
-                p3 = { x: -20, y: clampedY };
+                // direction === 'left'
+                if (canFitOutsideLeft) {
+                    p0 = { x: sx1, y: boxCenterY };
+                    p1 = { x: sx1 - 10, y: boxCenterY };
+                    p2 = { x: -8, y: clampedY };
+                    p3 = { x: -18, y: clampedY };
+                    badgeLeft = `${(-BADGE_WIDTH - 18).toFixed(1)}px`;
+                } else if (canFitOutsideRight) {
+                    p0 = { x: sx2, y: boxCenterY };
+                    p1 = { x: sx2 + 10, y: boxCenterY };
+                    p2 = { x: rect.width + 8, y: clampedY };
+                    p3 = { x: rect.width + 18, y: clampedY };
+                    badgeLeft = `${(rect.width + 18).toFixed(1)}px`;
+                } else {
+                    // Dock inside canvas left edge (safely away from Imajev log panel!)
+                    const targetX = 12;
+                    p0 = { x: sx1, y: boxCenterY };
+                    p1 = { x: Math.max(targetX + BADGE_WIDTH + 8, (sx1 + targetX + BADGE_WIDTH) / 2), y: boxCenterY };
+                    p2 = { x: targetX + BADGE_WIDTH + 6, y: clampedY };
+                    p3 = { x: targetX + BADGE_WIDTH + 2, y: clampedY };
+                    badgeLeft = `${targetX.toFixed(1)}px`;
+                }
             }
 
             // 1. Build SVG Connector Group
@@ -1001,7 +1047,7 @@ class AnonymizerStudio {
             }
             groupEl.appendChild(polyline);
 
-            // Terminal dot at label attachment outside canvas
+            // Terminal dot at label attachment
             const dot3 = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
             dot3.setAttribute('cx', p3.x.toFixed(1));
             dot3.setAttribute('cy', clampedY.toFixed(1));
@@ -1011,21 +1057,15 @@ class AnonymizerStudio {
 
             svgFragment.appendChild(groupEl);
 
-            // 2. Build Minimal HTML Callout Badge (Strictly Outside Canvas)
+            // 2. Build Minimal HTML Callout Badge (Safely positioned)
             const badge = document.createElement('div');
             badge.dataset.detectionId = det.id;
 
             badge.style.position = 'absolute';
             badge.style.top = `${clampedY.toFixed(1)}px`;
-            badge.style.width = '120px';
-            if (direction === 'right') {
-                badge.style.left = `${(rect.width + 20).toFixed(1)}px`;
-                badge.style.transform = 'translate(0, -50%)';
-            } else {
-                // Fixed 120px width placed strictly outside canvas with safe 20px margin (-140px to -20px)
-                badge.style.left = '-140px';
-                badge.style.transform = 'translate(0, -50%)';
-            }
+            badge.style.width = `${BADGE_WIDTH}px`;
+            badge.style.left = badgeLeft;
+            badge.style.transform = 'translate(0, -50%)';
 
             // High-contrast HUD aesthetics
             const borderCol = isMasked
@@ -1258,7 +1298,7 @@ class AnonymizerStudio {
             }
             
             const item = document.createElement('div');
-            item.className = 'flex flex-col gap-1.5 p-3 rounded-lg bg-zinc-900/70 border border-zinc-800/60 transition-all duration-300 opacity-0 translate-y-2 relative overflow-hidden group cursor-pointer';
+            item.className = 'group flex flex-col gap-2 p-3 rounded-xl bg-zinc-900/80 border border-zinc-800/80 hover:border-cyan-500/50 hover:bg-zinc-900 transition-all duration-200 opacity-0 translate-y-2 relative overflow-hidden cursor-pointer shadow-sm';
 
             if (logData.id) {
                 item.dataset.detectionId = logData.id;
@@ -1278,28 +1318,33 @@ class AnonymizerStudio {
                 });
             }
 
-            let actionMarkup = '';
+            let actionBadge = '';
             let barColor = 'bg-cyan-500';
+            let barDotColor = 'bg-cyan-400';
             
             if (logData.action === 'approved') {
-                actionMarkup = `<span class="text-emerald-400 font-bold tracking-widest">[APPROVED]</span>`;
-                barColor = 'bg-emerald-500';
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-emerald-950/90 text-emerald-400 border border-emerald-800/80 shadow-[0_0_8px_rgba(16,185,129,0.25)]">[APPROVED]</span>`;
+                barColor = 'bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.5)]';
+                barDotColor = 'bg-emerald-400';
             } else if (logData.action === 'rejected') {
-                actionMarkup = `<span class="text-red-400 font-bold tracking-widest">[REJECTED]</span>`;
-                barColor = 'bg-red-500';
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-rose-950/90 text-rose-400 border border-rose-800/80 shadow-[0_0_8px_rgba(244,63,94,0.25)]">[REJECTED]</span>`;
+                barColor = 'bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.5)]';
+                barDotColor = 'bg-rose-400';
             } else if (logData.action === 'error') {
-                actionMarkup = `<span class="text-orange-500 font-bold tracking-widest">[ERROR]</span>`;
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-orange-950/90 text-orange-400 border border-orange-800/80">[ERROR]</span>`;
                 barColor = 'bg-orange-500';
+                barDotColor = 'bg-orange-400';
             } else {
-                actionMarkup = `<span class="text-cyan-400 font-bold tracking-widest">[INFO]</span>`;
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-cyan-950/90 text-cyan-400 border border-cyan-800/80 shadow-[0_0_8px_rgba(6,182,212,0.25)]">[INFO]</span>`;
             }
 
-            let title = logData.entity ? logData.entity.toUpperCase() : 'SYSTEM';
-            if (logData.text_preview) title += ` - "${logData.text_preview}"`;
-            
-            let messageMarkup = logData.message ? `<div class="text-[11px] text-zinc-300 mt-1">${this.escapeHtml(logData.message)}</div>` : '';
-            if (logData.reason && !logData.message) {
-                 messageMarkup = `<div class="text-[11px] text-zinc-300 mt-1">Reason: ${this.escapeHtml(logData.reason)}</div>`;
+            let entityName = logData.entity ? logData.entity.toUpperCase() : 'SYSTEM';
+            if (logData.text_preview) entityName += ` "${logData.text_preview}"`;
+
+            let messageMarkup = '';
+            const msg = logData.message || (logData.reason ? `دلیل تصمیم: ${logData.reason}` : '');
+            if (msg) {
+                messageMarkup = `<div class="text-[11px] text-zinc-300 leading-relaxed font-sans px-0.5" dir="auto">${this.escapeHtml(msg)}</div>`;
             }
 
             let metricsMarkup = '';
@@ -1308,33 +1353,38 @@ class AnonymizerStudio {
                 const unkPercent = logData.unknown_prob !== undefined ? Math.round(logData.unknown_prob * 100) : 0;
                 
                 metricsMarkup = `
-                    <div class="flex items-center gap-4 mt-1.5 text-[10px]">
-                        <div class="flex-1">
-                            <div class="flex justify-between mb-1">
-                                <span class="text-zinc-400">Confidence</span>
-                                <span class="text-zinc-200">${confPercent}%</span>
+                    <div class="flex flex-col gap-1.5 pt-2 border-t border-zinc-800/60 text-[10px] font-mono select-none" dir="ltr">
+                        <div class="flex items-center gap-2">
+                            <span class="text-zinc-400 w-16 flex-shrink-0 flex items-center gap-1">
+                                <span class="w-1.5 h-1.5 rounded-full ${barDotColor}"></span>
+                                Conf
+                            </span>
+                            <div class="flex-1 bg-zinc-950 rounded-full h-1.5 overflow-hidden border border-zinc-800/80">
+                                <div class="${barColor} h-full rounded-full transition-all duration-500" style="width: ${confPercent}%"></div>
                             </div>
-                            <div class="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
-                                <div class="${barColor} h-full rounded-full" style="width: ${confPercent}%"></div>
-                            </div>
+                            <span class="text-zinc-200 font-semibold w-7 text-right">${confPercent}%</span>
                         </div>
-                        <div class="flex-1">
-                            <div class="flex justify-between mb-1">
-                                <span class="text-zinc-400">Unknown Prob</span>
-                                <span class="text-zinc-200">${unkPercent}%</span>
+                        <div class="flex items-center gap-2">
+                            <span class="text-zinc-400 w-16 flex-shrink-0 flex items-center gap-1">
+                                <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                                Unknown
+                            </span>
+                            <div class="flex-1 bg-zinc-950 rounded-full h-1.5 overflow-hidden border border-zinc-800/80">
+                                <div class="bg-amber-400 h-full rounded-full transition-all duration-500" style="width: ${unkPercent}%"></div>
                             </div>
-                            <div class="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
-                                <div class="bg-amber-500 h-full rounded-full" style="width: ${unkPercent}%"></div>
-                            </div>
+                            <span class="text-amber-400/90 font-semibold w-7 text-right">${unkPercent}%</span>
                         </div>
                     </div>
                 `;
             }
 
             item.innerHTML = `
-                <div class="flex items-center justify-between text-xs font-mono">
-                    <span class="text-zinc-100 font-semibold">${title}</span>
-                    ${actionMarkup}
+                <div class="flex items-center justify-between gap-2" dir="ltr">
+                    <div class="flex items-center gap-1.5 overflow-hidden">
+                        ${actionBadge}
+                        <span class="text-[10px] font-semibold text-zinc-300 bg-zinc-800/90 border border-zinc-700/60 px-1.5 py-0.5 rounded tracking-wider uppercase truncate">${this.escapeHtml(entityName)}</span>
+                    </div>
+                    <span class="text-[9px] font-mono text-zinc-500 bg-zinc-950/60 px-1.5 py-0.5 rounded border border-zinc-800 flex-shrink-0">#${String(index + 1).padStart(2, '0')}</span>
                 </div>
                 ${messageMarkup}
                 ${metricsMarkup}
@@ -1345,7 +1395,7 @@ class AnonymizerStudio {
                 item.classList.remove('opacity-0', 'translate-y-2');
                 item.classList.add('opacity-100', 'translate-y-0');
                 container.scrollTop = container.scrollHeight;
-            }, index * 90);
+            }, index * 80);
         });
     }
 
