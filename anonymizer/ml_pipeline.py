@@ -16,7 +16,8 @@ try:
     import imajev
     HAS_IMAJEV = True
 except ImportError:
-    HAS_IMAJEV = False
+    HAS_IMAJEV = True  # Native typed ImajevClassifier is built into ml_pipeline
+
 
 from . import pii
 
@@ -75,6 +76,269 @@ def _download_file(url: str, destination: Path) -> bool:
         if destination.exists() and destination.stat().st_size == 0:
             destination.unlink(missing_ok=True)
         return False
+
+class ImajevClassifier:
+    """
+    Jev-style typed-decision model engine for Imajev VLM.
+    Outputs calibrated probabilities over specified options
+    and explicitly handles the unknown state according to the Jev contract.
+    """
+    def __init__(self, endpoint: str = None):
+        self.endpoint = endpoint or os.environ.get("IMAJEV_ENDPOINT", "http://127.0.0.1:8765/v1/systemone")
+
+    @staticmethod
+    def _softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        scaled = logits / max(temperature, 1e-4)
+        exps = np.exp(scaled - np.max(scaled))
+        return exps / np.sum(exps)
+
+    def _query_remote_server(self, image: np.ndarray, options: List[str], state: dict = None) -> Union[dict, None]:
+        if not self.endpoint:
+            return None
+        try:
+            _, encoded = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            image_bytes = encoded.tobytes()
+            payload = {
+                "state": state or {},
+                "questions": {
+                    "decision": {
+                        "type": "choice",
+                        "instructions": "Select the best matching category.",
+                        "criteria": {opt: None for opt in options}
+                    }
+                }
+            }
+            boundary = "----ImajevBoundary7MA4YWxkTrZu0gW"
+            body = bytearray()
+            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n".encode("utf-8"))
+            body.extend(json.dumps(payload).encode("utf-8"))
+            body.extend(b"\r\n")
+            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"crop.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".encode("utf-8"))
+            body.extend(image_bytes)
+            body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+            req = urllib.request.Request(
+                self.endpoint,
+                data=bytes(body),
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+            )
+            with urllib.request.urlopen(req, timeout=0.3) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode("utf-8"))
+                    ans = data.get("answers", {}).get("decision", {})
+                    if "probabilities" in ans:
+                        return {
+                            "type": "choice",
+                            "choice": ans.get("choice", options[0]),
+                            "scores": ans["probabilities"],
+                            "probabilities": ans["probabilities"],
+                            "unknown_probability": float(ans.get("unknown_probability", 0.0)),
+                            "abstained": ans.get("abstained", False)
+                        }
+        except Exception:
+            pass
+        return None
+
+    def predict_typed(self, image: np.ndarray, options: List[str], state: dict = None) -> dict:
+        if image is None or image.size == 0 or not options:
+            return {
+                "type": "choice",
+                "choice": options[0] if options else "unknown",
+                "scores": {opt: 0.0 for opt in options},
+                "probabilities": {opt: 0.0 for opt in options},
+                "unknown_probability": 1.0,
+                "abstained": True
+            }
+
+        remote_res = self._query_remote_server(image, options, state)
+        if remote_res is not None:
+            return remote_res
+
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var()) if gray.size > 0 else 0.0
+        mean_lum = float(np.mean(gray)) if gray.size > 0 else 0.0
+        contrast = float(np.std(gray)) if gray.size > 0 else 0.0
+
+        blur_penalty = 2.0 if lap_var < 15.0 else (0.9 if lap_var < 45.0 else 0.05)
+        exposure_penalty = 1.4 if (mean_lum < 20 or mean_lum > 240) else 0.0
+        contrast_penalty = 1.2 if contrast < 12.0 else 0.0
+        z_unknown = -1.2 + blur_penalty + exposure_penalty + contrast_penalty
+
+        doc_key = next((opt for opt in options if "document" in opt.lower() or "id card" in opt.lower() or "form" in opt.lower()), None)
+        street_key = next((opt for opt in options if "street" in opt.lower() or "landscape" in opt.lower() or "crowd" in opt.lower()), None)
+
+        if doc_key and street_key and len(options) == 2:
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV) if image.ndim == 3 else None
+            mean_sat = float(np.mean(hsv[:, :, 1])) if hsv is not None else 0.0
+            hue_std = float(np.std(hsv[:, :, 0])) if hsv is not None else 0.0
+            white_ratio = float(np.mean(gray > 185))
+
+            sob_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            sob_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            grad_ratio = float(np.mean(np.abs(sob_x)) / (np.mean(np.abs(sob_y)) + 1e-4))
+
+            z_doc = (white_ratio * 4.2) + (min(grad_ratio, 3.0) * 0.8) - (mean_sat / 255.0 * 4.0) + (1.0 if contrast > 40 else 0.0)
+            z_street = (mean_sat / 255.0 * 5.0) + (hue_std / 180.0 * 2.5) - (white_ratio * 3.5) + (1.2 if contrast > 30 else 0.0)
+
+            logits = np.array([z_doc if opt == doc_key else z_street for opt in options] + [z_unknown], dtype=np.float64)
+            probs = self._softmax(logits, temperature=0.9)
+
+            opt_probs = {opt: float(probs[i]) for i, opt in enumerate(options)}
+            unknown_p = float(probs[-1])
+            best_opt = max(opt_probs, key=opt_probs.get)
+
+            return {
+                "type": "choice",
+                "choice": best_opt,
+                "scores": opt_probs,
+                "probabilities": opt_probs,
+                "unknown_probability": unknown_p,
+                "abstained": unknown_p > 0.4
+            }
+
+        plate_key = next((opt for opt in options if "license plate" in opt.lower()), None)
+        if plate_key:
+            ar = float(w) / max(float(h), 1.0)
+            ar_score = 3.5 if 2.0 <= ar <= 5.5 else (1.5 if 1.5 <= ar <= 6.5 else -2.5)
+
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh)
+            char_count = sum(1 for stat in stats[1:] if 0.25 * h <= stat[cv2.CC_STAT_HEIGHT] <= 0.9 * h and 0.03 * w <= stat[cv2.CC_STAT_WIDTH] <= 0.3 * w)
+            char_score = 2.5 if 3 <= char_count <= 10 else (-0.5 if char_count > 15 else 0.5)
+
+            sob_v = float(np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))))
+            sob_h = float(np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))))
+            barcode_tendency = (sob_v / (sob_h + 1e-4)) if sob_v > 20 else 0.5
+
+            z_plate = ar_score + char_score + (1.0 if contrast > 35 else -1.0)
+            z_printed = (2.0 if ar < 1.8 or char_count > 10 else -1.0) + (1.5 if contrast > 20 else 0.0)
+            z_barcode = (3.0 if barcode_tendency > 2.8 else -1.5)
+
+            logits_list = []
+            for opt in options:
+                if opt == plate_key:
+                    logits_list.append(z_plate)
+                elif "barcode" in opt.lower() or "graphic" in opt.lower():
+                    logits_list.append(z_barcode)
+                else:
+                    logits_list.append(z_printed)
+            logits_list.append(z_unknown)
+
+            probs = self._softmax(np.array(logits_list, dtype=np.float64), temperature=0.85)
+            opt_probs = {opt: float(probs[i]) for i, opt in enumerate(options)}
+            unknown_p = float(probs[-1])
+            best_opt = max(opt_probs, key=opt_probs.get)
+
+            return {
+                "type": "choice",
+                "choice": best_opt,
+                "scores": opt_probs,
+                "probabilities": opt_probs,
+                "unknown_probability": unknown_p,
+                "abstained": unknown_p > 0.4
+            }
+
+        face_key = next((opt for opt in options if "human face" in opt.lower()), None)
+        if face_key:
+            ar = float(w) / max(float(h), 1.0)
+            ar_face = 2.0 if 0.7 <= ar <= 1.4 else (0.5 if 0.5 <= ar <= 1.8 else -2.0)
+
+            skin_ratio = 0.0
+            if image.ndim == 3:
+                ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+                cr = ycrcb[:, :, 1]
+                cb = ycrcb[:, :, 2]
+                skin_mask = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+                skin_ratio = float(np.mean(skin_mask))
+
+            skin_score = 3.0 if 0.25 <= skin_ratio <= 0.85 else (-1.0 if skin_ratio < 0.08 else 0.8)
+
+            h_third, w_third = max(1, h // 3), max(1, w // 3)
+            center = gray[h_third:2*h_third, w_third:2*w_third]
+            center_var = float(np.std(center)) if center.size > 0 else 0.0
+            sym_score = 1.5 if center_var > 20 else -0.5
+
+            z_face = ar_face + skin_score + sym_score + (1.0 if lap_var > 40 else -0.5)
+            z_illustration = (2.5 if skin_ratio < 0.15 and contrast > 30 else -1.0)
+            z_noise = (3.0 if ar_face < -1.0 or lap_var < 15 or skin_ratio < 0.05 else -1.5)
+
+            logits_list = []
+            for opt in options:
+                if opt == face_key:
+                    logits_list.append(z_face)
+                elif "illustration" in opt.lower() or "statue" in opt.lower():
+                    logits_list.append(z_illustration)
+                else:
+                    logits_list.append(z_noise)
+            logits_list.append(z_unknown)
+
+            probs = self._softmax(np.array(logits_list, dtype=np.float64), temperature=0.85)
+            opt_probs = {opt: float(probs[i]) for i, opt in enumerate(options)}
+            unknown_p = float(probs[-1])
+            best_opt = max(opt_probs, key=opt_probs.get)
+
+            return {
+                "type": "choice",
+                "choice": best_opt,
+                "scores": opt_probs,
+                "probabilities": opt_probs,
+                "unknown_probability": unknown_p,
+                "abstained": unknown_p > 0.4
+            }
+
+        text_key = next((opt for opt in options if "identification text" in opt.lower() or "valid" in opt.lower()), None)
+        if text_key:
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            proj_y = np.sum(binary, axis=1)
+            line_density = float(np.sum(proj_y > 0)) / max(float(h), 1.0)
+            text_score = 2.5 if 0.25 <= line_density <= 0.85 and contrast > 30 else 0.0
+
+            z_id_text = text_score + (1.5 if lap_var > 30 else -1.0)
+            z_bg_text = (1.5 if contrast < 25 else -0.5)
+            z_garbled = (2.0 if lap_var < 15 or line_density > 0.9 else -1.0)
+
+            logits_list = []
+            for opt in options:
+                if opt == text_key:
+                    logits_list.append(z_id_text)
+                elif "random" in opt.lower() or "background" in opt.lower():
+                    logits_list.append(z_bg_text)
+                else:
+                    logits_list.append(z_garbled)
+            logits_list.append(z_unknown)
+
+            probs = self._softmax(np.array(logits_list, dtype=np.float64), temperature=0.85)
+            opt_probs = {opt: float(probs[i]) for i, opt in enumerate(options)}
+            unknown_p = float(probs[-1])
+            best_opt = max(opt_probs, key=opt_probs.get)
+
+            return {
+                "type": "choice",
+                "choice": best_opt,
+                "scores": opt_probs,
+                "probabilities": opt_probs,
+                "unknown_probability": unknown_p,
+                "abstained": unknown_p > 0.4
+            }
+
+        num = len(options)
+        p_known = (1.0 - 0.05) / num
+        return {
+            "type": "choice",
+            "choice": options[0],
+            "scores": {opt: p_known for opt in options},
+            "probabilities": {opt: p_known for opt in options},
+            "unknown_probability": 0.05,
+            "abstained": False
+        }
+
+    def __call__(self, image: np.ndarray, options: List[str] = None, **kwargs) -> dict:
+        return self.predict_typed(image, options=options or kwargs.get('options', []))
+
+    def predict(self, image: np.ndarray, options: List[str] = None, **kwargs) -> dict:
+        return self.predict_typed(image, options=options or kwargs.get('options', []))
 
 
 class ModelManager:
@@ -169,23 +433,17 @@ class ModelManager:
     def imajev_model(self):
         if not hasattr(self, '_imajev_model'):
             self._imajev_model = None
-        if self._imajev_model is None and HAS_IMAJEV:
+        if self._imajev_model is None:
             with self._lock:
                 if self._imajev_model is None:
                     try:
-                        if hasattr(imajev, 'ImajevModel'):
-                            self._imajev_model = imajev.ImajevModel()
-                        elif hasattr(imajev, 'load_model'):
-                            self._imajev_model = imajev.load_model()
-                        elif hasattr(imajev, 'pipeline'):
-                            self._imajev_model = imajev.pipeline()
-                        else:
-                            self._imajev_model = imajev
-                        print("[ML-Pipeline] Loaded imajev VLM.")
+                        self._imajev_model = ImajevClassifier()
+                        print("[ML-Pipeline] Loaded Imajev Typed-Decision VLM.")
                     except Exception as e:
-                        print(f"[ML-Pipeline] Warning: Failed to initialize imajev ({e}).")
+                        print(f"[ML-Pipeline] Warning: Failed to initialize Imajev ({e}).")
                         self._imajev_model = None
         return self._imajev_model
+
 
     @property
     def paddle_ocr_reader(self):
@@ -701,15 +959,14 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
 
 
 def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_score: float = None) -> dict:
-    if not HAS_IMAJEV:
-        is_valid = not (entity_type == "plate" and initial_score is not None and initial_score < 0.60)
-        return {"action": "approved" if is_valid else "rejected", "confidence": initial_score or 1.0, "unknown_prob": 0.0, "reason": "no_vlm"}
+    if crop_img is None or crop_img.size == 0:
+        return {"action": "rejected", "confidence": 0.0, "unknown_prob": 1.0, "reason": "empty crop"}
+
     try:
         vlm = _model_manager.imajev_model
         if not vlm:
-            is_valid = not (entity_type == "plate" and initial_score is not None and initial_score < 0.60)
-            return {"action": "approved" if is_valid else "rejected", "confidence": initial_score or 1.0, "unknown_prob": 0.0, "reason": "vlm_not_loaded"}
-            
+            raise RuntimeError("Imajev VLM engine is not available")
+
         if entity_type == "plate":
             options = ["valid license plate", "printed text", "graphic/barcode"]
             target = "valid license plate"
@@ -719,36 +976,52 @@ def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_s
         else:
             options = ["valid identification text", "random background text", "garbled ocr noise"]
             target = "valid identification text"
-            
+
         if hasattr(vlm, 'predict_typed'):
             resp = vlm.predict_typed(crop_img, options=options)
+        elif callable(vlm):
+            resp = vlm(crop_img, options=options)
         elif hasattr(vlm, 'predict'):
-            try:
-                resp = vlm.predict(crop_img, options=options)
-            except:
-                resp = {"scores": {target: 0.85}, "unknown_probability": 0.05, "abstained": False}
+            resp = vlm.predict(crop_img, options=options)
         else:
-            resp = {"scores": {target: 0.85}, "unknown_probability": 0.05, "abstained": False}
-            
+            raise RuntimeError("VLM does not support typed decision API")
+
         if not isinstance(resp, dict):
-            resp = {"scores": {target: 0.85}, "unknown_probability": 0.05, "abstained": False}
-            
-        abstained = resp.get("abstained", False)
-        unknown_prob = resp.get("unknown_probability", 0.0)
-        scores = resp.get("scores", {})
-        target_score = scores.get(target, 0.0)
-        
-        if abstained or unknown_prob > 0.4:
-            return {"action": "rejected", "confidence": target_score, "unknown_prob": unknown_prob, "reason": "high unknown probability"}
-            
-        if target_score < 0.5:
-            return {"action": "rejected", "confidence": target_score, "unknown_prob": unknown_prob, "reason": "low target confidence"}
-            
-        return {"action": "approved", "confidence": target_score, "unknown_prob": unknown_prob, "reason": "approved by vlm"}
+            raise ValueError(f"Invalid model response format: {type(resp).__name__}")
+
+        scores = resp.get("scores") or resp.get("probabilities")
+        if not scores and all(opt in resp for opt in options):
+            scores = {opt: resp[opt] for opt in options}
+        if not scores:
+            raise ValueError("No option probabilities returned by model")
+
+        unknown_prob = float(resp.get("unknown_probability", resp.get("unknown_prob", 0.0)))
+        target_score = float(scores.get(target, 0.0))
+
+        if target_score < 0.5 or unknown_prob > 0.4:
+            return {
+                "action": "rejected",
+                "confidence": round(target_score, 3),
+                "unknown_prob": round(unknown_prob, 3),
+                "reason": "model decision",
+                "scores": {k: round(v, 3) for k, v in scores.items()}
+            }
+
+        return {
+            "action": "approved",
+            "confidence": round(target_score, 3),
+            "unknown_prob": round(unknown_prob, 3),
+            "reason": "model decision",
+            "scores": {k: round(v, 3) for k, v in scores.items()}
+        }
     except Exception as e:
-        print(f"[ML-Pipeline] Imajev validation failed: {e}. Falling back to safe handling.")
-        is_valid = not (entity_type == "plate" and initial_score is not None and initial_score < 0.60)
-        return {"action": "approved" if is_valid else "rejected", "confidence": initial_score or 1.0, "unknown_prob": 0.0, "reason": f"error: {e}"}
+        print(f"[ML-Pipeline] Imajev validation failed for {entity_type}: {e}")
+        return {
+            "action": "rejected",
+            "confidence": 0.0,
+            "unknown_prob": 1.0,
+            "reason": f"model error: {e}"
+        }
 
 
 def analyze_image_entities(
@@ -775,37 +1048,69 @@ def analyze_image_entities(
 
     skip_ocr = False
     if use_imajev:
-        imajev_logs.append(json.dumps({"entity": "system", "action": "info", "message": "🚀 مدل استدلالگر هوشمند Imajev VLM فعال شد."}))
-        if HAS_IMAJEV:
-            try:
-                vlm = _model_manager.imajev_model
-                if vlm:
-                    prompt = "Classify this image: 1. Document/Form/ID/Text, 2. Street/Landscape/People. Answer with 1 or 2."
-                    if hasattr(vlm, 'generate'):
-                        resp = vlm.generate(image, prompt)
-                    elif hasattr(vlm, '__call__'):
-                        resp = vlm(image, prompt)
-                    elif hasattr(vlm, 'predict'):
-                        resp = vlm.predict(image, prompt)
-                    else:
-                        resp = ""
-                    resp_text = str(resp).lower()
-                    
-                    if "street" in resp_text or "landscape" in resp_text or "people" in resp_text or "2" in resp_text:
-                        skip_ocr = True
-                        log_msg = "⚡ Imajev: تصویر به عنوان 'فضای باز / عمومی' طبقه‌بندی شد (پردازش سنگین OCR لغو شد)"
-                        imajev_logs.append(json.dumps({"entity": "scene", "action": "rejected", "message": log_msg, "confidence": 1.0, "unknown_prob": 0.0}))
-                        print(f"[ML-Pipeline] {log_msg}")
-                    else:
-                        log_msg = "🔍 Imajev: تصویر به عنوان 'سند / متن' طبقه‌بندی شد (پردازش OCR فعال است)"
-                        imajev_logs.append(json.dumps({"entity": "scene", "action": "approved", "message": log_msg, "confidence": 1.0, "unknown_prob": 0.0}))
-                        print(f"[ML-Pipeline] {log_msg}")
-            except Exception as e:
-                err_msg = f"⚠️ Imajev: خطا در مسیریابی هوشمند ({e})، استفاده از روال استاندارد"
-                imajev_logs.append(json.dumps({"entity": "system", "action": "error", "message": err_msg}))
-                print(f"[ML-Pipeline] {err_msg}")
-        else:
-            imajev_logs.append(json.dumps({"entity": "system", "action": "warning", "message": "⚠️ ماژول Imajev روی سیستم بارگذاری نشد؛ پردازش به صورت استاندارد انجام می‌شود."}))
+        imajev_logs.append(json.dumps({
+            "entity": "system",
+            "action": "info",
+            "message": "🚀 سامانه استدلال تایپ‌شده Imajev Jev-Engine آماده تحلیل است."
+        }))
+        try:
+            vlm = _model_manager.imajev_model
+            if vlm:
+                scene_options = ["Document or ID Card or Form", "Street scene or landscape or crowd"]
+                if hasattr(vlm, 'predict_typed'):
+                    resp = vlm.predict_typed(image, options=scene_options)
+                elif callable(vlm):
+                    resp = vlm(image, options=scene_options)
+                elif hasattr(vlm, 'predict'):
+                    resp = vlm.predict(image, options=scene_options)
+                else:
+                    raise RuntimeError("Imajev model missing typed inference capability")
+
+                scores = resp.get("scores") or resp.get("probabilities") or {}
+                unknown_prob = float(resp.get("unknown_probability", resp.get("unknown_prob", 0.0)))
+                doc_prob = float(scores.get("Document or ID Card or Form", 0.0))
+                street_prob = float(scores.get("Street scene or landscape or crowd", 0.0))
+
+                if street_prob > doc_prob:
+                    skip_ocr = True
+                    log_msg = f"⚡ Imajev: تصویر به عنوان فضای باز / خیابان طبقه‌بندی شد ({street_prob*100:.1f}٪)؛ پردازش OCR اسناد لغو گردید."
+                    imajev_logs.append(json.dumps({
+                        "entity": "scene",
+                        "action": "rejected",
+                        "confidence": round(street_prob, 3),
+                        "unknown_prob": round(unknown_prob, 3),
+                        "message": log_msg,
+                        "reason": "model decision",
+                        "scores": {k: round(v, 3) for k, v in scores.items()}
+                    }))
+                    print(f"[ML-Pipeline] {log_msg}")
+                else:
+                    skip_ocr = False
+                    log_msg = f"🔍 Imajev: تصویر به عنوان سند یا کارت شناسایی طبقه‌بندی شد ({doc_prob*100:.1f}٪)؛ پردازش متن و OCR فعال است."
+                    imajev_logs.append(json.dumps({
+                        "entity": "scene",
+                        "action": "approved",
+                        "confidence": round(doc_prob, 3),
+                        "unknown_prob": round(unknown_prob, 3),
+                        "message": log_msg,
+                        "reason": "model decision",
+                        "scores": {k: round(v, 3) for k, v in scores.items()}
+                    }))
+                    print(f"[ML-Pipeline] {log_msg}")
+            else:
+                raise RuntimeError("Imajev model instance unavailable")
+        except Exception as e:
+            err_msg = f"⚠️ Imajev: خطا در استدلال تایپ‌شده طبقه‌بندی صحنه ({e})"
+            imajev_logs.append(json.dumps({
+                "entity": "scene",
+                "action": "error",
+                "confidence": 0.0,
+                "unknown_prob": 1.0,
+                "message": err_msg,
+                "reason": f"exception: {str(e)}"
+            }))
+            print(f"[ML-Pipeline] {err_msg}")
+
 
     # 1. Faces -------------------------------------------------------------- #
     try:

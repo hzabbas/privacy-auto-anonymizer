@@ -1285,25 +1285,54 @@ class AnonymizerStudio {
         }
 
         if (!logs || logs.length === 0) {
-            container.innerHTML = `<div class="text-zinc-500 text-[11px] italic p-2.5 bg-zinc-900/30 rounded-lg border border-zinc-800/40">هیچ تصمیمی توسط Imajev برای این تصویر ثبت نشد.</div>`;
+            container.innerHTML = `<div class="text-zinc-500 text-[11px] italic p-3 bg-zinc-950/40 rounded-xl border border-zinc-800/40">هیچ تصمیمی توسط سامانه استدلال Imajev برای این تصویر ثبت نشد.</div>`;
             return;
         }
 
         logs.forEach((logStr, index) => {
             let logData = {};
-            try {
-                logData = JSON.parse(logStr);
-            } catch (e) {
-                logData = { entity: 'system', message: logStr, action: 'info' };
+            if (typeof logStr === 'string') {
+                try {
+                    logData = JSON.parse(logStr);
+                } catch (e) {
+                    logData = { entity: 'system', message: logStr, action: 'info' };
+                }
+            } else if (typeof logStr === 'object' && logStr !== null) {
+                logData = logStr;
             }
-            
+
             const item = document.createElement('div');
-            item.className = 'group flex flex-col gap-2 p-3 rounded-xl bg-zinc-900/80 border border-zinc-800/80 hover:border-cyan-500/50 hover:bg-zinc-900 transition-all duration-200 opacity-0 translate-y-2 relative overflow-hidden cursor-pointer shadow-sm';
+            const action = String(logData.action || 'info').toLowerCase();
+
+            let actionBadge = '';
+            let itemBorder = 'border-zinc-800/80 hover:border-cyan-500/50 bg-zinc-900/80';
+            let barColor = 'bg-cyan-500 shadow-[0_0_6px_rgba(6,182,212,0.5)]';
+            let barDotColor = 'bg-cyan-400';
+
+            if (action === 'approved') {
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-emerald-950/90 text-emerald-400 border border-emerald-500/80 shadow-[0_0_10px_rgba(16,185,129,0.35)] flex items-center gap-1 select-none"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>[APPROVED]</span>`;
+                itemBorder = 'border-emerald-900/70 hover:border-emerald-500/70 bg-zinc-950/90 shadow-[0_0_15px_rgba(16,185,129,0.06)]';
+                barColor = 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.7)]';
+                barDotColor = 'bg-emerald-400';
+            } else if (action === 'rejected') {
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-red-950/90 text-red-400 border border-red-500/80 shadow-[0_0_10px_rgba(239,68,68,0.35)] flex items-center gap-1 select-none"><span class="w-1.5 h-1.5 rounded-full bg-red-400"></span>[REJECTED]</span>`;
+                itemBorder = 'border-red-900/70 hover:border-red-500/70 bg-zinc-950/90 shadow-[0_0_15px_rgba(239,68,68,0.06)]';
+                barColor = 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.7)]';
+                barDotColor = 'bg-red-400';
+            } else if (action === 'error') {
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-amber-950/90 text-amber-400 border border-amber-600/80 shadow-[0_0_8px_rgba(245,158,11,0.3)] flex items-center gap-1 select-none">[ERROR]</span>`;
+                itemBorder = 'border-amber-900/70 hover:border-amber-500/70 bg-zinc-950/90';
+                barColor = 'bg-amber-500 shadow-[0_0_6px_rgba(245,158,11,0.5)]';
+                barDotColor = 'bg-amber-400';
+            } else {
+                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-cyan-950/90 text-cyan-400 border border-cyan-800/80 shadow-[0_0_8px_rgba(6,182,212,0.25)] select-none">[INFO]</span>`;
+                itemBorder = 'border-zinc-800/80 hover:border-cyan-500/50 bg-zinc-900/80';
+            }
+
+            item.className = `group flex flex-col gap-2 p-3 rounded-xl border transition-all duration-200 opacity-0 translate-y-2 relative overflow-hidden cursor-pointer shadow-sm ${itemBorder}`;
 
             if (logData.id) {
                 item.dataset.detectionId = logData.id;
-                
-                // Canvas coordination: hover effects
                 item.addEventListener('mouseenter', () => {
                     if (this.hoveredDetectionId !== logData.id) {
                         this.hoveredDetectionId = logData.id;
@@ -1318,26 +1347,6 @@ class AnonymizerStudio {
                 });
             }
 
-            let actionBadge = '';
-            let barColor = 'bg-cyan-500';
-            let barDotColor = 'bg-cyan-400';
-            
-            if (logData.action === 'approved') {
-                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-emerald-950/90 text-emerald-400 border border-emerald-800/80 shadow-[0_0_8px_rgba(16,185,129,0.25)]">[APPROVED]</span>`;
-                barColor = 'bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.5)]';
-                barDotColor = 'bg-emerald-400';
-            } else if (logData.action === 'rejected') {
-                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-rose-950/90 text-rose-400 border border-rose-800/80 shadow-[0_0_8px_rgba(244,63,94,0.25)]">[REJECTED]</span>`;
-                barColor = 'bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.5)]';
-                barDotColor = 'bg-rose-400';
-            } else if (logData.action === 'error') {
-                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-orange-950/90 text-orange-400 border border-orange-800/80">[ERROR]</span>`;
-                barColor = 'bg-orange-500';
-                barDotColor = 'bg-orange-400';
-            } else {
-                actionBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-cyan-950/90 text-cyan-400 border border-cyan-800/80 shadow-[0_0_8px_rgba(6,182,212,0.25)]">[INFO]</span>`;
-            }
-
             let entityName = logData.entity ? logData.entity.toUpperCase() : 'SYSTEM';
             if (logData.text_preview) entityName += ` "${logData.text_preview}"`;
 
@@ -1348,32 +1357,50 @@ class AnonymizerStudio {
             }
 
             let metricsMarkup = '';
-            if (logData.confidence !== undefined) {
-                const confPercent = Math.round(logData.confidence * 100);
-                const unkPercent = logData.unknown_prob !== undefined ? Math.round(logData.unknown_prob * 100) : 0;
-                
+            if (logData.confidence !== undefined && logData.confidence !== null) {
+                const confVal = parseFloat(logData.confidence);
+                const confPercent = Math.min(100, Math.max(0, Math.round(confVal * 100)));
+                const unkVal = logData.unknown_prob !== undefined && logData.unknown_prob !== null ? parseFloat(logData.unknown_prob) : 0;
+                const unkPercent = Math.min(100, Math.max(0, Math.round(unkVal * 100)));
+
+                let scoresMarkup = '';
+                if (logData.scores && typeof logData.scores === 'object') {
+                    const entries = Object.entries(logData.scores);
+                    if (entries.length > 0) {
+                        const chips = entries.map(([optName, optScore]) => {
+                            const p = Math.round(parseFloat(optScore) * 100);
+                            return `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950/80 border border-zinc-800/80 text-[9px] text-zinc-400">
+                                <span class="text-zinc-300 truncate max-w-[130px]">${this.escapeHtml(optName)}:</span>
+                                <span class="text-cyan-400 font-mono font-semibold">${p}%</span>
+                            </span>`;
+                        }).join('');
+                        scoresMarkup = `<div class="flex flex-wrap gap-1 pt-1.5 border-t border-zinc-800/40">${chips}</div>`;
+                    }
+                }
+
                 metricsMarkup = `
                     <div class="flex flex-col gap-1.5 pt-2 border-t border-zinc-800/60 text-[10px] font-mono select-none" dir="ltr">
                         <div class="flex items-center gap-2">
                             <span class="text-zinc-400 w-16 flex-shrink-0 flex items-center gap-1">
                                 <span class="w-1.5 h-1.5 rounded-full ${barDotColor}"></span>
-                                Conf
+                                Target
                             </span>
                             <div class="flex-1 bg-zinc-950 rounded-full h-1.5 overflow-hidden border border-zinc-800/80">
-                                <div class="${barColor} h-full rounded-full transition-all duration-500" style="width: ${confPercent}%"></div>
+                                <div class="${barColor} h-full rounded-full transition-all duration-700 ease-out" style="width: ${confPercent}%"></div>
                             </div>
-                            <span class="text-zinc-200 font-semibold w-7 text-right">${confPercent}%</span>
+                            <span class="text-zinc-100 font-bold w-9 text-right">${confPercent}%</span>
                         </div>
                         <div class="flex items-center gap-2">
                             <span class="text-zinc-400 w-16 flex-shrink-0 flex items-center gap-1">
-                                <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                                <span class="w-1.5 h-1.5 rounded-full ${unkPercent > 40 ? 'bg-red-400 animate-pulse' : 'bg-amber-400'}"></span>
                                 Unknown
                             </span>
                             <div class="flex-1 bg-zinc-950 rounded-full h-1.5 overflow-hidden border border-zinc-800/80">
-                                <div class="bg-amber-400 h-full rounded-full transition-all duration-500" style="width: ${unkPercent}%"></div>
+                                <div class="${unkPercent > 40 ? 'bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.5)]' : 'bg-amber-400'} h-full rounded-full transition-all duration-700 ease-out" style="width: ${unkPercent}%"></div>
                             </div>
-                            <span class="text-amber-400/90 font-semibold w-7 text-right">${unkPercent}%</span>
+                            <span class="${unkPercent > 40 ? 'text-red-400 font-bold' : 'text-amber-400/90'} font-semibold w-9 text-right">${unkPercent}%</span>
                         </div>
+                        ${scoresMarkup}
                     </div>
                 `;
             }
@@ -1395,7 +1422,7 @@ class AnonymizerStudio {
                 item.classList.remove('opacity-0', 'translate-y-2');
                 item.classList.add('opacity-100', 'translate-y-0');
                 container.scrollTop = container.scrollHeight;
-            }, index * 80);
+            }, index * 60);
         });
     }
 
