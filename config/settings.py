@@ -11,21 +11,38 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure--c9#dd3z0jbak6st6(+()3_(s3_4oq^1o7lxkm$amab%0wqm3y'
+# The fallback below is a development-only key; export DJANGO_SECRET_KEY to
+# override it (e.g. when deploying this project anywhere public).
+SECRET_KEY = os.environ.get(
+    "DJANGO_SECRET_KEY",
+    "django-insecure--c9#dd3z0jbak6st6(+()3_(s3_4oq^1o7lxkm$amab%0wqm3y",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = _env_flag("DJANGO_DEBUG", "1")
 
-ALLOWED_HOSTS = ['*']
+# With DEBUG on, any host is accepted by default so the app can be demoed from
+# another device on the local network (e.g. 192.168.x.x during the presentation);
+# with DEBUG off only explicit hosts are served. Override both with
+# DJANGO_ALLOWED_HOSTS="host1,host2".
+_ALLOWED_HOSTS_DEFAULT = "*" if DEBUG else "localhost,127.0.0.1,[::1]"
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", _ALLOWED_HOSTS_DEFAULT).split(",") if h.strip()
+]
 
 
 # Application definition
@@ -120,6 +137,45 @@ STATICFILES_DIRS = [
     BASE_DIR / 'static',
 ]
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+
+# Upload handling ----------------------------------------------------------- #
+# The privacy contract of this project is that an uploaded document is only ever
+# held in RAM and never written to disk. Django streams uploads to a temporary
+# file once they exceed FILE_UPLOAD_MAX_MEMORY_SIZE (2.5 MB by default), which
+# would silently break that contract: both limits below are therefore raised so
+# that an upload of up to MAX_UPLOAD_SIZE stays in an InMemoryUploadedFile.
+MAX_UPLOAD_SIZE = 30 * 1024 * 1024          # enforced again in views.py (413)
+DATA_UPLOAD_MAX_MEMORY_SIZE = MAX_UPLOAD_SIZE
+FILE_UPLOAD_MAX_MEMORY_SIZE = MAX_UPLOAD_SIZE
+
+
+# Logging ------------------------------------------------------------------- #
+# Surface the pipeline's INFO logs (model loading, engine fallbacks, Imajev
+# decisions) in the runserver console; everything else keeps Django's default.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {
+            'format': '[{levelname}] {name}: {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+    },
+    'loggers': {
+        'anonymizer': {
+            'handlers': ['console'],
+            'level': os.environ.get('ANONYMIZER_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
+    },
+}
 
 
 # Email

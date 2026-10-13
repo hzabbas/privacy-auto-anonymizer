@@ -4,16 +4,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Auto-Anonymizer</title>
-    <!-- Google Fonts: Vazirmatn & Inter (Non-blocking for fast initial page render) -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@300;400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <noscript>
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@300;400;500;600;700&display=swap">
-    </noscript>
-    <!-- Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <meta name="description" content="سامانه تعاملی پالایش خودکار داده‌های حساس (چهره، پلاک خودرو و متون) در تصاویر و اسناد؛ تحلیل و ماسک‌گذاری کاملاً محلی و بدون ذخیره‌سازی تصویر.">
+    <meta name="theme-color" content="#09090b">
+    <title>Privacy Auto-Anonymizer | پالایش خودکار داده‌های حساس</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%2306b6d4' d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/%3E%3C/svg%3E">
+
+    <!-- Local stylesheet: design tokens, self-hosted fonts, HUD components -->
+    <link rel="stylesheet" href="{% static 'css/style.css' %}">
+
+    <!-- Tailwind (vendored build: the UI also works fully offline) -->
+    <script src="{% static 'vendor/tailwind.min.js' %}"></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -33,43 +33,24 @@
                     }
                 }
             }
-        }
+        };
     </script>
-    <style>
-        body {
-            background-color: #09090b;
-            color: #fafafa;
-        }
-        /* Custom delicate scrollbar */
-        ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #09090b;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #27272a;
-            border-radius: 9999px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: #3f3f46;
-        }
-        .canvas-grid {
-            background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
-            background-size: 20px 20px;
-        }
-    </style>
 </head>
 <body class="min-h-screen flex flex-col font-sans bg-[#09090b] text-zinc-100 selection:bg-zinc-800 selection:text-white antialiased">
 
+    <noscript>
+        <div class="bg-amber-950/60 border-b border-amber-800/60 text-amber-200 text-xs text-center px-4 py-2">
+            برای استفاده از قابلیت‌های تعاملی این سامانه (رسم کادرها، ماسک‌گذاری و استخراج تصویر) باید JavaScript در مرورگر فعال باشد.
+        </div>
+    </noscript>
+
     <!-- Minimalist Engineering Header -->
     <header class="border-b border-zinc-800/60 bg-[#09090b]/80 backdrop-blur-md sticky top-0 z-50">
-        <div class="max-w-6xl mx-auto px-5 sm:px-8 py-3 min-h-[3.5rem] flex flex-wrap items-center justify-between gap-4">
+        <div class="max-w-7xl mx-auto px-5 sm:px-8 py-3 min-h-[3.5rem] flex flex-wrap items-center justify-between gap-4">
             <!-- Brand Info -->
             <div class="flex items-center gap-3">
                 <div class="w-7 h-7 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-200">
-                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
                         <path d="M9 12l2 2 4-4"/>
                     </svg>
@@ -82,41 +63,64 @@
 
             <!-- Upload Action Button & Settings -->
             <div class="flex flex-wrap items-center gap-3">
-                <!-- Settings Panel -->
-                <div class="flex flex-wrap items-center gap-2 sm:ml-3 sm:border-l border-zinc-800/80 sm:pl-3">
-                    <select id="ocrEngineSelect" class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-center">
-                        <option value="easyocr">EasyOCR (سریع/پیش‌فرض)</option>
-                        <option value="paddleocr">PaddleOCR (دقت بالا)</option>
-                        <option value="doctr">DocTR (متراکم)</option>
-                    </select>
-                    <select id="layoutEngineSelect" class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-center">
-                        <option value="regex">Regex & Fuzzy (سبک)</option>
-                        <option value="layoutparser">LayoutParser (هوشمند)</option>
-                    </select>
+                <!-- Settings Panel: two clearly labelled dropdowns (OCR + layout).
+                     The divider uses logical borders (border-s / ms / ps) so it
+                     stays on the correct side in RTL and no longer collides with
+                     the status badge area. -->
+                <div class="flex flex-wrap items-center gap-2 sm:ms-3 sm:border-s border-zinc-800/80 sm:ps-3">
+                    <div class="relative inline-flex items-center">
+                        <span class="pointer-events-none absolute start-2 top-1/2 -translate-y-1/2 text-[10px] font-mono font-semibold text-cyan-400/90 select-none" aria-hidden="true">OCR:</span>
+                        <select id="ocrEngineSelect" title="موتور بازشناسی متن (OCR)" aria-label="موتور بازشناسی متن (OCR)"
+                                class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg ps-11 pe-7 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-start">
+                            <option value="easyocr">EasyOCR (پیش‌فرض)</option>
+                            <option value="paddleocr" {% if not engine_status.paddleocr %}disabled{% endif %}>PaddleOCR{% if engine_status.paddleocr %} (دقت بالا){% else %} — نصب نشده{% endif %}</option>
+                            <option value="doctr" {% if not engine_status.doctr %}disabled{% endif %}>DocTR{% if engine_status.doctr %} (اسناد چاپی){% else %} — نصب نشده{% endif %}</option>
+                        </select>
+                        <svg class="pointer-events-none absolute end-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <polyline points="6 9 12 15 18 9"/>
+                        </svg>
+                    </div>
+                    <div class="relative inline-flex items-center">
+                        <span class="pointer-events-none absolute start-2 top-1/2 -translate-y-1/2 text-[10px] font-mono font-semibold text-cyan-400/90 select-none" aria-hidden="true">چیدمان:</span>
+                        <select id="layoutEngineSelect" title="روش تحلیل چیدمان سند" aria-label="روش تحلیل چیدمان سند"
+                                class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg ps-14 pe-7 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-start">
+                            <option value="regex">Regex &amp; Fuzzy (پیش‌فرض — کارت و مدارک)</option>
+                            <option value="doctr_layout" {% if not engine_status.doctr_layout %}disabled{% endif %}>فیلتر چیدمان (LW-DETR){% if not engine_status.doctr_layout %} — نصب نشده{% endif %}</option>
+                            <option value="layoutparser" {% if not engine_status.layoutparser %}disabled{% endif %}>LayoutParser{% if engine_status.layoutparser %} (هوشمند){% else %} — نصب نشده{% endif %}</option>
+                        </select>
+                        <svg class="pointer-events-none absolute end-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <polyline points="6 9 12 15 18 9"/>
+                        </svg>
+                    </div>
 
                     <!-- Imajev VLM Toggle Switch -->
-                    <label for="imajevToggle" class="relative inline-flex items-center gap-2.5 cursor-pointer select-none bg-zinc-900/80 hover:bg-zinc-850 border border-zinc-800 hover:border-cyan-500/40 text-zinc-300 hover:text-white rounded-xl px-3 py-1.5 transition-all duration-200 shadow-sm group">
+                    <label for="imajevToggle" class="relative inline-flex items-center gap-2.5 cursor-pointer select-none bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-800 hover:border-cyan-500/40 text-zinc-300 hover:text-white rounded-xl px-3 py-1.5 transition-all duration-200 shadow-sm group">
                         <span class="text-xs font-medium tracking-tight text-zinc-300 group-hover:text-zinc-100 flex items-center gap-1.5">
                             <span class="inline-block w-2 h-2 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(6,182,212,0.8)]"></span>
-                            <span>استدلالگر هوشمند <span class="font-mono text-cyan-400 font-semibold">Imajev</span></span>
+                            <span>استدلال‌گر هوشمند <span class="font-mono text-cyan-400 font-semibold">Imajev</span></span>
                         </span>
                         <input type="checkbox" id="imajevToggle" class="sr-only peer">
-                        <div dir="ltr" class="w-9 h-5 bg-zinc-800/90 peer-checked:bg-cyan-950 rounded-full border border-zinc-700/80 peer-checked:border-cyan-400/90 transition-all duration-300 relative flex items-center p-0.5 peer-checked:shadow-[0_0_10px_rgba(6,182,212,0.4)]">
-                            <span class="w-4 h-4 bg-zinc-400 peer-checked:bg-cyan-400 rounded-full transition-all duration-300 transform translate-x-0 peer-checked:translate-x-4 shadow-sm flex items-center justify-center">
-                                <span class="w-1.5 h-1.5 rounded-full bg-zinc-700 peer-checked:bg-cyan-950 transition-colors"></span>
-                            </span>
-                        </div>
+                        <!-- The knob is a ::after pseudo-element on the checked-peer
+                             *sibling*: Tailwind's peer-checked: variant only reaches
+                             siblings, never grandchildren — the old nested <span>
+                             therefore never animated. -->
+                        <div dir="ltr" aria-hidden="true"
+                             class="relative w-9 h-5 bg-zinc-800/90 rounded-full border border-zinc-700/80 transition-all duration-300
+                                    after:content-[''] after:absolute after:start-0.5 after:top-1/2 after:-translate-y-1/2 after:h-4 after:w-4 after:rounded-full after:bg-zinc-400 after:transition-all after:duration-300
+                                    peer-focus-visible:ring-2 peer-focus-visible:ring-cyan-500/40
+                                    peer-checked:bg-cyan-950 peer-checked:border-cyan-400/90 peer-checked:shadow-[0_0_10px_rgba(6,182,212,0.4)]
+                                    peer-checked:after:translate-x-4 peer-checked:after:bg-cyan-400 peer-checked:after:shadow-[0_0_6px_rgba(6,182,212,0.8)]"></div>
                     </label>
                 </div>
-                
+
                 <!-- Status Badge -->
-                <div id="statusBadge" class="hidden items-center gap-2 px-3 py-1 rounded-full bg-zinc-900/90 border border-zinc-800 text-xs text-zinc-300">
+                <div id="statusBadge" role="status" aria-live="polite" class="hidden items-center gap-2 px-3 py-1 rounded-full bg-zinc-900/90 border border-zinc-800 text-xs text-zinc-300">
                     <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
                     <span id="statusText" class="font-normal text-[11px]"></span>
                 </div>
 
                 <label for="imageUploadInput" class="cursor-pointer inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 text-xs font-medium transition-all duration-200 shadow-sm active:scale-[0.98]">
-                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                         <polyline points="17 8 12 3 7 8"/>
                         <line x1="12" y1="3" x2="12" y2="15"/>
@@ -129,11 +133,11 @@
     </header>
 
     <!-- Main Workspace -->
-    <main id="mainWorkspace" class="flex-1 max-w-6xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-4 transition-all duration-300">
-        
+    <main id="mainWorkspace" class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-4 transition-all duration-300">
+
         <!-- Legend (Entity Color Guides) -->
         <div id="legendContainer" class="hidden items-center justify-between text-xs px-2 text-zinc-400">
-            <div class="flex items-center gap-5">
+            <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
                 <div class="flex items-center gap-1.5">
                     <span class="w-2.5 h-2.5 rounded-full bg-cyan-500 shadow-[0_0_8px_rgba(6,182,212,0.8)]"></span>
                     <span class="text-zinc-300">چهره (Face)</span>
@@ -155,38 +159,43 @@
 
         <!-- Central Workspace Grid (Canvas + Imajev Log Panel) -->
         <div id="workspaceGrid" class="flex-1 w-full grid grid-cols-1 gap-4 transition-all duration-300">
-            
+
             <!-- Central Canvas / Dropzone Area -->
             <div id="dropzoneContainer" class="w-full bg-[#0c0c0e] border border-dashed border-zinc-800/80 hover:border-zinc-700 rounded-xl relative flex flex-col items-center justify-center min-h-[500px] overflow-hidden transition-all duration-300 group canvas-grid">
-                
+
                 <!-- Empty State / Dropzone -->
                 <div id="placeholderState" class="flex flex-col items-center justify-center text-center p-8 z-10 select-none">
                     <div class="w-14 h-14 rounded-xl bg-zinc-900/90 border border-zinc-800/80 flex items-center justify-center text-zinc-400 mb-4 group-hover:border-zinc-700 group-hover:text-zinc-200 transition-colors duration-300">
-                        <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
                             <circle cx="8.5" cy="8.5" r="1.5"/>
                             <polyline points="21 15 16 10 5 21"/>
                         </svg>
                     </div>
                     <h3 class="text-sm font-medium text-zinc-200 mb-1">تصویر را اینجا رها کنید</h3>
-                    <p class="text-xs text-zinc-500 max-w-xs mb-5 leading-relaxed">پشتیبانی از فرمت‌های PNG ،JPG و WEBP جهت ردیابی و محو خودکار چهره، پلاک و متون</p>
+                    <p class="text-xs text-zinc-500 max-w-xs mb-5 leading-relaxed">
+                        پشتیبانی از فرمت‌های PNG، JPG و WEBP جهت ردیابی و محو خودکار چهره، پلاک و متون
+                    </p>
                     <label for="dropzoneFileInput" class="cursor-pointer inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-white text-xs font-medium border border-zinc-800/90 transition-all duration-200">
                         <span>انتخاب فایل</span>
                     </label>
                     <input type="file" id="dropzoneFileInput" accept="image/*" class="hidden">
+                    <p class="text-[10px] text-zinc-600 mt-3 font-mono">
+                        MAX {{ max_upload_mb }} MB · processed locally, nothing is stored
+                    </p>
                 </div>
 
-                <!-- Canvas HUD Container (Standard flex container without restrictive side bounds) -->
-                <div id="canvasContainer" class="relative hidden flex items-center justify-center max-h-[70vh] w-auto my-auto">
-                    <canvas id="editor-canvas" class="block max-w-full max-h-[70vh] rounded-lg shadow-2xl object-contain"></canvas>
+                <!-- Canvas HUD Container (lateral gutters are reserved by the script when possible) -->
+                <div id="canvasContainer" class="relative hidden flex items-center justify-center max-h-[70vh] w-auto my-auto transition-all duration-200">
+                    <canvas id="editor-canvas" class="block max-w-full max-h-[70vh] rounded-lg shadow-2xl object-contain" aria-label="بوم ویرایش تصویر و کادرهای شناسایی‌شده"></canvas>
                     <!-- SVG Connector Lines Layer -->
-                    <svg id="connector-layer" class="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible"></svg>
+                    <svg id="connector-layer" class="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible" aria-hidden="true"></svg>
                     <!-- HTML Callout Labels Layer -->
                     <div id="labels-layer" class="absolute inset-0 w-full h-full pointer-events-none z-20 overflow-visible"></div>
                 </div>
 
                 <!-- Loading Spinner Overlay -->
-                <div id="loadingOverlay" class="hidden absolute inset-0 z-30 bg-[#09090b]/80 backdrop-blur-sm flex-col items-center justify-center rounded-xl transition-all duration-300">
+                <div id="loadingOverlay" class="hidden absolute inset-0 z-30 bg-[#09090b]/80 backdrop-blur-sm flex-col items-center justify-center rounded-xl transition-all duration-300" role="status" aria-live="polite">
                     <div class="relative flex items-center justify-center mb-3">
                         <div class="w-10 h-10 rounded-full border-2 border-zinc-800 border-t-cyan-500 animate-spin"></div>
                         <div class="absolute w-5 h-5 rounded-full bg-cyan-500/20 animate-ping"></div>
@@ -207,7 +216,7 @@
                             <span class="w-2.5 h-2.5 rounded-full bg-emerald-500/80 shadow-[0_0_6px_rgba(16,185,129,0.4)]"></span>
                         </div>
                         <span class="text-[11px] font-mono text-zinc-300 font-semibold mr-1.5 flex items-center gap-1.5">
-                            <svg class="w-3.5 h-3.5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <svg class="w-3.5 h-3.5 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                                 <polyline points="4 17 10 11 4 5"/>
                                 <line x1="12" y1="19" x2="20" y2="19"/>
                             </svg>
@@ -224,13 +233,13 @@
                 <div class="px-3.5 py-1.5 bg-zinc-950/60 border-b border-zinc-800/40 flex items-center justify-between text-[10px] text-zinc-400 font-mono">
                     <span class="text-cyan-400/90 font-medium flex items-center gap-1">
                         <span class="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
-                        استدلالگر و اعتبارسنج بصری
+                        استدلال‌گر و اعتبارسنج بصری
                     </span>
                     <span id="imajevLogCount" class="text-zinc-500">0 رویداد</span>
                 </div>
 
                 <!-- Terminal Body (Log Messages Container) -->
-                <div id="imajevLogContent" class="flex-1 p-3.5 font-mono text-xs overflow-y-auto space-y-2.5 max-h-[550px] scrollbar-thin scrollbar-thumb-zinc-800 select-text">
+                <div id="imajevLogContent" aria-live="polite" class="flex-1 p-3.5 font-mono text-xs overflow-y-auto space-y-2.5 max-h-[550px] select-text">
                     <div id="imajevLogPlaceholder" class="text-zinc-500 text-[11px] leading-relaxed italic p-2.5 bg-zinc-900/30 rounded-lg border border-zinc-800/40">
                         کنسول استدلال هوشمند فعال است. با بارگذاری تصویر، ردیابی معنایی سند، دورزدن هوشمند OCR و اعتبارسنجی کادرهای مرزی در اینجا به صورت زنده نمایش داده خواهد شد.
                     </div>
@@ -248,25 +257,25 @@
 
         <!-- Bottom Operational Controls -->
         <footer class="bg-[#0c0c0e] border border-zinc-800/80 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-            
+
             <!-- Quick Batch Actions -->
             <div class="flex items-center flex-wrap gap-2">
                 <button type="button" id="btnAutoRedact" disabled class="disabled:opacity-30 disabled:cursor-not-allowed inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-emerald-300 hover:bg-emerald-900/60 hover:text-white text-xs font-medium transition-all duration-200 shadow-sm">
-                    <svg class="w-3.5 h-3.5 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg class="w-3.5 h-3.5 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
                     </svg>
                     <span>سانسور خودکار همه</span>
                 </button>
 
                 <button type="button" id="btnSelectAll" disabled class="disabled:opacity-30 disabled:cursor-not-allowed inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 hover:text-white text-xs font-medium transition-all duration-200">
-                    <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <polyline points="20 6 9 17 4 12"/>
                     </svg>
                     <span>انتخاب همه</span>
                 </button>
 
                 <button type="button" id="btnDeselectAll" disabled class="disabled:opacity-30 disabled:cursor-not-allowed inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 hover:text-white text-xs font-medium transition-all duration-200">
-                    <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <line x1="18" y1="6" x2="6" y2="18"/>
                         <line x1="6" y1="6" x2="18" y2="18"/>
                     </svg>
@@ -274,11 +283,16 @@
                 </button>
             </div>
 
+            <!-- Privacy Note -->
+            <p class="text-[10px] text-zinc-500 font-mono hidden md:block">
+                in-memory processing · no upload retention
+            </p>
+
             <!-- Comparison & Export Actions -->
             <div class="flex items-center gap-2.5">
                 <!-- Before/After Comparison (Hold to Peek) -->
-                <button type="button" id="btnCompare" disabled class="disabled:opacity-30 disabled:cursor-not-allowed select-none inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 hover:text-white text-xs font-medium transition-all duration-200 active:bg-cyan-950 active:border-cyan-800 active:text-cyan-300" title="برای دیدن تصویر خام اصلی کلیک را نگه دارید">
-                    <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <button type="button" id="btnCompare" disabled class="disabled:opacity-30 disabled:cursor-not-allowed select-none inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 hover:text-white text-xs font-medium transition-all duration-200 active:bg-cyan-950 active:border-cyan-800 active:text-cyan-300" title="برای دیدن تصویر خام، کلیک را نگه دارید (یا کلید Space را نگه دارید)">
+                    <svg class="w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
                         <circle cx="12" cy="12" r="3"/>
                     </svg>
@@ -287,7 +301,7 @@
 
                 <!-- Export Clean Image Action -->
                 <button type="button" id="btnExport" disabled class="disabled:opacity-30 disabled:cursor-not-allowed inline-flex items-center gap-2 px-4 py-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 text-xs font-semibold transition-all duration-200 shadow-sm active:scale-[0.98]">
-                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                         <polyline points="7 10 12 15 17 10"/>
                         <line x1="12" y1="15" x2="12" y2="3"/>
@@ -299,7 +313,7 @@
 
     </main>
 
-    <!-- Client-side Logic (Canvas initialization, AI inference, & Neon rendering) -->
+    <!-- Client-side logic: canvas initialisation, API calls and HUD rendering -->
     <script src="{% static 'js/app.js' %}"></script>
 </body>
 </html>

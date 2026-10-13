@@ -2,40 +2,56 @@ import os
 import sys
 import threading
 import urllib.request
+import difflib
 from pathlib import Path
-from typing import Union, Dict, Any, List
+from typing import Union, Dict, Any, List, Tuple
 import numpy as np
 import cv2
 import re
 import json
 import math
+import logging
+import time
 import warnings
-warnings.filterwarnings("ignore")
-
-try:
-    import imajev
-    HAS_IMAJEV = True
-except ImportError:
-    HAS_IMAJEV = True  # Native typed ImajevClassifier is built into ml_pipeline
-
 
 from . import pii
 
+logger = logging.getLogger(__name__)
+
+# Silence only the known-noisy numeric-library warnings (OpenMP duplicate libs,
+# future-deprecation spam from torch/paddle). Everything else stays visible.
+for _noisy in ("torch", "paddle", "ultralytics", "easyocr", "doctr"):
+    warnings.filterwarnings("ignore", module=rf"^{_noisy}")
+
 # Tunable thresholds -------------------------------------------------------- #
-# Plate detector is noisy on documents (it fires on printed words), so it uses a
-# stricter floor and OCR verification below PLATE_CASCADE_BELOW.
+# Plate detector floor. The detector is unreliable on documents (it fires on
+# printed words), so every surviving candidate is verified against its OCR text
+# in the plate stage below - confidence alone is not evidence of a plate.
 PLATE_MIN_CONFIDENCE = 0.45
+# A plate at/above this score counts as "confident" and may absorb the text
+# detections that overlap it (see _suppressed_by_plate).
 PLATE_CASCADE_BELOW = 0.60
 # YOLOv8-face boxes are tight; expand each side by this ratio before masking.
 FACE_EXPAND_RATIO = 0.10
 # OCR words below this recognition confidence are treated as noise.
 OCR_MIN_CONFIDENCE = 0.20
+# Refuse absurdly large uploads before decoding them (DoS / memory guard).
+MAX_IMAGE_PIXELS = 60_000_000
+# Above this fraction of near-white pixels the input is treated as a scanned
+# document / screenshot, where plate candidates must be verified strictly.
+DOCUMENT_WHITE_RATIO = 0.35
 # OCR languages. The project targets English documents; English-only recognition
 # (english_g2) is markedly more accurate on Latin text than the Arabic-script model
 # that EasyOCR selects when 'fa' is enabled. Override with e.g. OCR_LANGS="en,fa".
 OCR_LANGS = [s.strip() for s in os.environ.get("OCR_LANGS", "en").split(",") if s.strip()]
 # Transformer NER (PERSON / LOCATION) is optional; disable with ENABLE_NER=0.
 ENABLE_NER = os.environ.get("ENABLE_NER", "1") != "0"
+# Timeout for the optional remote Imajev inference server.
+IMAJEV_TIMEOUT = float(os.environ.get("IMAJEV_TIMEOUT", "2.0"))
+# After a failed remote call, skip the endpoint for this many seconds.
+IMAJEV_REMOTE_COOLDOWN = int(os.environ.get("IMAJEV_REMOTE_COOLDOWN", "120"))
+# Page-layout model used by the 'doctr_layout' engine (DocLayNet classes).
+DOCTR_LAYOUT_ARCH = os.environ.get("DOCTR_LAYOUT_ARCH", "lw_detr_s")
 
 # Ensure UTF-8 output encoding across Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -60,21 +76,32 @@ PLATE_MODEL_URL = "https://huggingface.co/Koushim/yolov8-license-plate-detection
 
 
 def _download_file(url: str, destination: Path) -> bool:
-    """Safely downloads model weights with timeout and error handling."""
+    """
+    Safely downloads model weights: streams to a temporary ``.part`` file and only
+    renames it into place once the transfer completed, so an interrupted download
+    can never leave a truncated ``.pt`` behind.
+    """
     if destination.exists() and destination.stat().st_size > 0:
         return True
+    part_path = destination.with_suffix(destination.suffix + ".part")
     try:
-        print(f"[ML-Pipeline] Downloading model weights to {destination}...")
+        logger.info("Downloading model weights to %s ...", destination)
         headers = {"User-Agent": "Mozilla/5.0"}
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as response, open(destination, "wb") as out_file:
-            out_file.write(response.read())
-        print(f"[ML-Pipeline] Successfully downloaded {destination.name}")
+        with urllib.request.urlopen(req, timeout=60) as response, open(part_path, "wb") as out_file:
+            while True:
+                chunk = response.read(1024 * 256)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+        if part_path.stat().st_size == 0:
+            raise IOError("downloaded file is empty")
+        part_path.replace(destination)
+        logger.info("Successfully downloaded %s", destination.name)
         return True
     except Exception as e:
-        print(f"[ML-Pipeline] Warning: Could not download {destination.name}: {e}")
-        if destination.exists() and destination.stat().st_size == 0:
-            destination.unlink(missing_ok=True)
+        logger.warning("Could not download %s: %s", destination.name, e)
+        part_path.unlink(missing_ok=True)
         return False
 
 class ImajevClassifier:
@@ -85,6 +112,8 @@ class ImajevClassifier:
     """
     def __init__(self, endpoint: str = None):
         self.endpoint = endpoint or os.environ.get("IMAJEV_ENDPOINT", "http://127.0.0.1:8765/v1/systemone")
+        self._remote_error_logged = False
+        self._remote_disabled_until = 0.0
 
     @staticmethod
     def _softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
@@ -93,7 +122,18 @@ class ImajevClassifier:
         return exps / np.sum(exps)
 
     def _query_remote_server(self, image: np.ndarray, options: List[str], state: dict = None) -> Union[dict, None]:
+        """
+        Optional remote inference: forwards the crop to a local Imajev VLM server
+        when one is running. Any network / protocol problem falls back to the
+        built-in heuristic classifier below.
+
+        A failed attempt also opens a short circuit breaker: without it, every
+        crop would wait for the connect timeout again and one unreachable server
+        would slow the whole analysis down by seconds.
+        """
         if not self.endpoint:
+            return None
+        if time.monotonic() < self._remote_disabled_until:
             return None
         try:
             _, encoded = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -109,20 +149,28 @@ class ImajevClassifier:
                 }
             }
             boundary = "----ImajevBoundary7MA4YWxkTrZu0gW"
+            crlf = chr(13) + chr(10)  # multipart bodies require CRLF separators
             body = bytearray()
-            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n".encode("utf-8"))
-            body.extend(json.dumps(payload).encode("utf-8"))
-            body.extend(b"\r\n")
-            body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"crop.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".encode("utf-8"))
-            body.extend(image_bytes)
-            body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+            body += (
+                f"--{boundary}{crlf}"
+                f'Content-Disposition: form-data; name="request"{crlf}{crlf}'
+            ).encode("utf-8")
+            body += json.dumps(payload).encode("utf-8")
+            body += crlf.encode("utf-8")
+            body += (
+                f"--{boundary}{crlf}"
+                f'Content-Disposition: form-data; name="image"; filename="crop.jpg"{crlf}'
+                f"Content-Type: image/jpeg{crlf}{crlf}"
+            ).encode("utf-8")
+            body += image_bytes
+            body += f"{crlf}--{boundary}--{crlf}".encode("utf-8")
 
             req = urllib.request.Request(
                 self.endpoint,
                 data=bytes(body),
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
-            with urllib.request.urlopen(req, timeout=0.3) as response:
+            with urllib.request.urlopen(req, timeout=IMAJEV_TIMEOUT) as response:
                 if response.status == 200:
                     data = json.loads(response.read().decode("utf-8"))
                     ans = data.get("answers", {}).get("decision", {})
@@ -135,8 +183,15 @@ class ImajevClassifier:
                             "unknown_probability": float(ans.get("unknown_probability", 0.0)),
                             "abstained": ans.get("abstained", False)
                         }
-        except Exception:
-            pass
+        except Exception as exc:
+            # Open the breaker for a while so the next crops answer instantly.
+            self._remote_disabled_until = time.monotonic() + IMAJEV_REMOTE_COOLDOWN
+            if not self._remote_error_logged:
+                logger.info(
+                    "Imajev remote endpoint unavailable (%s); using the built-in classifier "
+                    "and skipping remote calls for %ds.", exc, IMAJEV_REMOTE_COOLDOWN,
+                )
+                self._remote_error_logged = True
         return None
 
     def predict_typed(self, image: np.ndarray, options: List[str], state: dict = None) -> dict:
@@ -356,8 +411,20 @@ class ModelManager:
             cls._instance._plate_model = None
             cls._instance._ocr_reader = None
             cls._instance._ner = None
+            cls._instance._paddle_ocr_reader = None
+            cls._instance._doctr_reader = None
+            cls._instance._layout_parser = None
+            cls._instance._doctr_layout_model = None
+            cls._instance._imajev_model = None
+            # Failure flags: a broken engine must not be re-initialized (and
+            # re-logged) on every single request.
             cls._instance._face_failed = False
             cls._instance._plate_failed = False
+            cls._instance._ocr_failed = False
+            cls._instance._paddle_failed = False
+            cls._instance._doctr_failed = False
+            cls._instance._layout_failed = False
+            cls._instance._doctr_layout_failed = False
         return cls._instance
 
     @staticmethod
@@ -371,12 +438,12 @@ class ModelManager:
         if not path.exists():
             _download_file(url, path)
         if not path.exists():
-            print(f"[ML-Pipeline] {name} weights unavailable; {name} detection disabled.")
+            logger.warning("%s weights unavailable; %s detection disabled.", name, name)
             return None
         try:
             return YOLO(str(path))
         except Exception as e:
-            print(f"[ML-Pipeline] Error loading {name} model: {e}")
+            logger.warning("Error loading %s model: %s", name, e)
             return None
 
     @property
@@ -399,9 +466,10 @@ class ModelManager:
 
     @property
     def ocr_reader(self):
-        if self._ocr_reader is None:
+        """Lazy EasyOCR reader (the always-available base OCR engine)."""
+        if self._ocr_reader is None and not self._ocr_failed:
             with self._lock:
-                if self._ocr_reader is None:
+                if self._ocr_reader is None and not self._ocr_failed:
                     import easyocr
                     try:
                         import torch
@@ -410,14 +478,24 @@ class ModelManager:
                         use_gpu = False
                     easyocr_storage = WEIGHTS_DIR / "easyocr"
                     easyocr_storage.mkdir(parents=True, exist_ok=True)
-                    # verbose=False avoids Windows cp1252 charmap encoding errors with progress bar characters
-                    self._ocr_reader = easyocr.Reader(
-                        OCR_LANGS,
-                        gpu=use_gpu,
-                        model_storage_directory=str(easyocr_storage),
-                        verbose=False
-                    )
+                    try:
+                        # verbose=False avoids Windows cp1252 charmap encoding errors
+                        # with progress-bar characters.
+                        self._ocr_reader = easyocr.Reader(
+                            OCR_LANGS,
+                            gpu=use_gpu,
+                            model_storage_directory=str(easyocr_storage),
+                            verbose=False
+                        )
+                        logger.info("Loaded EasyOCR (%s).", ", ".join(OCR_LANGS))
+                    except Exception as e:
+                        logger.error("EasyOCR could not be initialized (%s); text detection disabled.", e)
+                        self._ocr_failed = True
         return self._ocr_reader
+
+    @property
+    def ocr_available(self) -> bool:
+        return self.ocr_reader is not None
 
     @property
     def ner(self):
@@ -431,36 +509,35 @@ class ModelManager:
 
     @property
     def imajev_model(self):
-        if not hasattr(self, '_imajev_model'):
-            self._imajev_model = None
+        """Built-in typed-decision reasoning engine (optionally backed by a local Imajev server)."""
         if self._imajev_model is None:
             with self._lock:
                 if self._imajev_model is None:
                     try:
                         self._imajev_model = ImajevClassifier()
-                        print("[ML-Pipeline] Loaded Imajev Typed-Decision VLM.")
+                        logger.info("Loaded Imajev typed-decision engine.")
                     except Exception as e:
-                        print(f"[ML-Pipeline] Warning: Failed to initialize Imajev ({e}).")
+                        logger.warning("Failed to initialize Imajev (%s).", e)
                         self._imajev_model = None
         return self._imajev_model
 
-
     @property
     def paddle_ocr_reader(self):
-        if not hasattr(self, '_paddle_ocr_reader'):
-            self._paddle_ocr_reader = None
-        if self._paddle_ocr_reader is None:
+        """Optional PaddleOCR engine; None (and no repeated retries) when unavailable."""
+        if self._paddle_ocr_reader is None and not self._paddle_failed:
             with self._lock:
-                if self._paddle_ocr_reader is None:
+                if self._paddle_ocr_reader is None and not self._paddle_failed:
                     try:
                         import inspect
                         from paddleocr import PaddleOCR
-                        
+
                         paddle_kwargs = {
                             'use_textline_orientation': False,
                             'lang': 'en',
                             'enable_mkldnn': False,
                         }
+                        # Only pass the document-preprocessing switches that this
+                        # PaddleOCR version actually supports.
                         sig = inspect.signature(PaddleOCR.__init__)
                         if 'use_doc_orientation_classify' in sig.parameters:
                             paddle_kwargs['use_doc_orientation_classify'] = False
@@ -468,49 +545,104 @@ class ModelManager:
                             paddle_kwargs['use_doc_unwarping'] = False
 
                         self._paddle_ocr_reader = PaddleOCR(**paddle_kwargs)
-                        print("[ML-Pipeline] Loaded PaddleOCR (Persian/English).")
-                    except ImportError:
-                        print("[ML-Pipeline] Warning: PaddleOCR not installed.")
-                        self._paddle_ocr_reader = None
+                        logger.info("Loaded PaddleOCR.")
                     except Exception as e:
-                        print(f"[ML-Pipeline] Warning: Failed to initialize PaddleOCR ({e}).")
+                        logger.warning("PaddleOCR unavailable (%s); the UI will fall back to EasyOCR.", e)
                         self._paddle_ocr_reader = None
+                        self._paddle_failed = True
         return self._paddle_ocr_reader
 
     @property
     def doctr_reader(self):
-        if not hasattr(self, '_doctr_reader'):
-            self._doctr_reader = None
-        if self._doctr_reader is None:
+        """Optional DocTR engine; None (and no repeated retries) when unavailable."""
+        if self._doctr_reader is None and not self._doctr_failed:
             with self._lock:
-                if self._doctr_reader is None:
+                if self._doctr_reader is None and not self._doctr_failed:
                     try:
                         from doctr.models import ocr_predictor
-                        self._doctr_reader = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True, assume_straight_pages=True)
-                        print("[ML-Pipeline] Loaded DocTR. Note: Standard DocTR weights are Latin-only. Persian/Arabic text may not be recognized.")
-                    except ImportError:
-                        print("[ML-Pipeline] Warning: DocTR not installed.")
+                        self._doctr_reader = ocr_predictor(
+                            det_arch='db_resnet50',
+                            reco_arch='crnn_vgg16_bn',
+                            pretrained=True,
+                            assume_straight_pages=True,
+                        )
+                        logger.info("Loaded DocTR (Latin-only recognizer: Persian text may not be recognized).")
+                    except Exception as e:
+                        logger.warning("DocTR unavailable (%s); the UI will fall back to EasyOCR.", e)
                         self._doctr_reader = None
+                        self._doctr_failed = True
         return self._doctr_reader
-        
+
     @property
     def layout_parser(self):
-        if not hasattr(self, '_layout_parser'):
-            self._layout_parser = None
-        if self._layout_parser is None:
+        """Optional LayoutParser (Detectron2) block detector; not installable on every platform."""
+        if self._layout_parser is None and not self._layout_failed:
             with self._lock:
-                if self._layout_parser is None:
+                if self._layout_parser is None and not self._layout_failed:
                     try:
                         import layoutparser as lp
-                        self._layout_parser = lp.Detectron2LayoutModel('lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config', extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5])
-                        print("[ML-Pipeline] Loaded LayoutParser.")
-                    except ImportError:
-                        print("[ML-Pipeline] Warning: LayoutParser not installed.")
+                        self._layout_parser = lp.Detectron2LayoutModel(
+                            'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
+                            extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
+                        )
+                        logger.info("Loaded LayoutParser.")
+                    except Exception as e:
+                        logger.warning("LayoutParser unavailable (%s); falling back to the regex layout.", e)
                         self._layout_parser = None
+                        self._layout_failed = True
         return self._layout_parser
+
+    @property
+    def doctr_layout_model(self):
+        """
+        Page-layout model (LW-DETR, DocLayNet classes) shipped with docTR.
+
+        Unlike LayoutParser this needs no Detectron2, so it also runs on Windows;
+        the whole engine is optional and degrades to the regex layout.
+        """
+        if self._doctr_layout_model is None and not self._doctr_layout_failed:
+            with self._lock:
+                if self._doctr_layout_model is None and not self._doctr_layout_failed:
+                    try:
+                        from doctr.models import layout_predictor
+                        self._doctr_layout_model = layout_predictor(
+                            arch=DOCTR_LAYOUT_ARCH, pretrained=True
+                        )
+                        logger.info("Loaded the docTR layout model (%s).", DOCTR_LAYOUT_ARCH)
+                    except Exception as e:
+                        logger.warning("docTR layout model unavailable (%s); falling back to the regex layout.", e)
+                        self._doctr_layout_model = None
+                        self._doctr_layout_failed = True
+        return self._doctr_layout_model
 
 # Global singleton instance
 _model_manager = ModelManager()
+
+
+def get_engine_status() -> Dict[str, bool]:
+    """
+    Reports which OCR / layout engines can actually be imported in the current
+    environment, so the UI can disable (instead of silently falling back from)
+    the engines that are not installed.
+    """
+    import importlib.util
+
+    def _installed(*modules: str) -> bool:
+        for module in modules:
+            try:
+                if importlib.util.find_spec(module) is None:
+                    return False
+            except (ImportError, ValueError):
+                return False
+        return True
+
+    return {
+        "easyocr": _installed("easyocr", "torch"),
+        "paddleocr": _installed("paddleocr", "paddle"),
+        "doctr": _installed("doctr", "torch"),
+        "layoutparser": _installed("layoutparser", "detectron2"),
+        "doctr_layout": _installed("doctr", "torch"),
+    }
 
 
 def _load_image(image_input: Union[str, Path, np.ndarray, bytes]) -> np.ndarray:
@@ -554,7 +686,28 @@ def _rect_polygon(x1: int, y1: int, x2: int, y2: int) -> List[List[int]]:
     return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
 
 
-def _iou(a: List[int], b: List[int]) -> float:
+def _clamp_polygon(polygon, width: int, height: int) -> List[List[int]]:
+    """
+    Rounds every vertex to whole pixels and clamps it into the image frame.
+
+    Shared by every polygon path: freshly mapped OCR polygons and the ones
+    rotated back through the deskew matrix (whose vertices can land slightly
+    outside the frame).
+    """
+    return [
+        [_clamp(int(round(x)), 0, width), _clamp(int(round(y)), 0, height)]
+        for x, y in polygon
+    ]
+
+
+def _polygon_bbox(polygon) -> List[int]:
+    """Axis-aligned bounding box [x1, y1, x2, y2] of a polygon's vertices."""
+    xs = [point[0] for point in polygon]
+    ys = [point[1] for point in polygon]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _iou(a: List[float], b: List[float]) -> float:
     ix1, iy1, ix2, iy2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
     if inter == 0:
@@ -566,13 +719,14 @@ def _iou(a: List[int], b: List[int]) -> float:
 
 def _plate_text_is_valid(text: str) -> bool:
     """
+    Lenient licence-plate test used on photographs.
+
     Real licence plates (US/EU/UK/Iran/...) contain alphanumeric characters,
     often with digits or uppercase letters (e.g. 'B 11 HOY', '21B34522').
-    This rejects the classic false positive of the plate detector
-    firing on printed words or names in text documents (e.g. 'Anthony Caldwell').
+    An unreadable crop is *kept* here: on a photograph the plate is often blurry
+    or distant, and dropping it would leave it visible.
     """
     if not text.strip():
-        # If crop is too blurry or distant for OCR to read, do not discard a detected vehicle plate
         return True
     alnum = re.sub(r"[^A-Za-z0-9\u0660-\u0669\u06F0-\u06F9\u0600-\u06FF]", "", text)
     if len(alnum) < 2 or len(alnum) > 14:
@@ -587,6 +741,40 @@ def _plate_text_is_valid(text: str) -> bool:
     if alnum.isupper() and 3 <= len(alnum) <= 8:
         return True
     return False
+
+
+_PLATE_DIGITS = "0123456789\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669\u06F0\u06F1\u06F2\u06F3\u06F4\u06F5\u06F6\u06F7\u06F8\u06F9"
+
+
+def _plate_text_looks_like_plate(text: str) -> bool:
+    """
+    Strict plate test used on document scans.
+
+    The plate detector is not trustworthy on documents - it fires at 0.6-0.8 on
+    ordinary text ("Utility Bill", "Ref: 88294", "Billing Currency: USD ($)") - so
+    there a candidate must actually *read* like a plate: a short run of uppercase
+    letters / digits / Persian characters containing at least one digit
+    ("B 11 HOY", "21B34522", "12 ب 345").
+    """
+    alnum = re.sub(r"[^A-Za-z0-9\u0600-\u06FF]", "", (text or "").strip())
+    if not alnum or not (2 <= len(alnum) <= 12):
+        return False
+    if not any(ch in _PLATE_DIGITS for ch in alnum):
+        return False
+    # Prose carries lowercase letters ("Ref88294", "UtilityBill"); plate lettering
+    # is uppercase or Persian script.
+    lowercase = sum(1 for ch in alnum if ch.islower())
+    return lowercase <= 1
+
+
+def _read_plate_text(ocr_reader, crop: np.ndarray) -> str:
+    """OCR of a plate candidate; small crops are upscaled so the recognizer can read them."""
+    verify_crop = crop
+    if verify_crop.shape[0] < 32:
+        scale = 32.0 / verify_crop.shape[0]
+        verify_crop = cv2.resize(verify_crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    results = ocr_reader.readtext(verify_crop, detail=1, paragraph=False)
+    return "".join(str(item[1]) for item in results)
 
 
 # --------------------------------------------------------------------------- #
@@ -679,6 +867,107 @@ def _expand_polygon(poly: List[List[float]], ratio_h: float, ratio_w: float) -> 
     ]
 
 
+# Evidence markers for a passport / ID data page (used by the corner-zone
+# fallback below): multilingual passport words plus the raw MRZ prefix.
+_PASSPORT_HINT_RE = re.compile(
+    r"(?i)passport|passeport|pasaporte|پاسپورت|گذرنامه|machine[- ]readable|P<"
+)
+
+
+def _passport_number_zone_spans(lines, spans, width: int, height: int) -> List[pii.PIISpan]:
+    """
+    Document-number fallback for the upper-right passport zone.
+
+    A passport data page prints its number twice: under the multilingual label
+    (handled by the cross-line pairing in pii.py) and again in the upper-right
+    corner. When the page shows passport evidence (an MRZ line or a passport
+    header was read), a standalone 8-10 digit line in the upper-right zone is
+    accepted as the document number even though no label preceded it.
+    """
+    passport_like = any(span.entity == "MRZ" for span in spans) or any(
+        _PASSPORT_HINT_RE.search(box.text) for line in lines for box in line
+    )
+    if not passport_like:
+        return []
+
+    extra: List[pii.PIISpan] = []
+    for line in lines:
+        text = " ".join(box.text for box in line).strip()
+        digits = re.sub(r"\D", "", text)
+        if not (8 <= len(digits) <= 10) or len(text) > len(digits) + 3:
+            continue
+        center_x = sum(box.cx for box in line) / len(line)
+        center_y = sum(box.cy for box in line) / len(line)
+        if center_x <= 0.5 * width or center_y >= 0.55 * height:
+            continue
+        start, end = line[0].start, line[-1].end
+        if any(span.start <= start and end <= span.end for span in spans):
+            continue                       # already covered by another span
+        extra.append(pii.PIISpan(start, end, "ID_NUMBER", 0.85, "passport_zone"))
+    return extra
+
+
+def _fingerprints_are_similar(a: str, b: str) -> bool:
+    """
+    True when two OCR readings of the same spot are the same text up to OCR
+    noise: one contains the other, or the readings agree at >= 90% similarity.
+    An extra or flapped character inside a 40-character MRZ line must not
+    defeat the collapse of a double read.
+    """
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    if abs(len(a) - len(b)) > max(2, int(0.12 * max(len(a), len(b)))):
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.9
+
+
+def _dedupe_ocr_boxes(boxes: List[_OCRBox]) -> List[_OCRBox]:
+    """
+    Collapses near-identical readings of the same word/line.
+
+    The OCR stage deliberately reads the frame twice (whole image + bottom MRZ
+    band), so a word inside that band comes back twice with (nearly) the same
+    box. Without this collapse the two readings are joined into a single
+    logical line ("07 Aug 1999 07 Aug 1999"), which breaks the date and MRZ
+    patterns and can mint false identifiers out of the doubled digits.
+
+    When one reading is a truncated version of the other (a filler tail cut
+    off mid-MRZ), the *more complete* text wins - a short reading would drop a
+    full MRZ line below the 28-character structural minimum.
+    """
+    kept: List[_OCRBox] = []
+    for box in sorted(boxes, key=lambda b: -b.conf):
+        fingerprint = _text_fingerprint(box.text)
+        duplicate_index = -1
+        for index, existing in enumerate(kept):
+            if not fingerprint or not _fingerprints_are_similar(
+                    fingerprint, _text_fingerprint(existing.text)):
+                continue
+            if _iou([existing.x1, existing.y1, existing.x2, existing.y2],
+                    [box.x1, box.y1, box.x2, box.y2]) > 0.45:
+                duplicate_index = index
+                break
+
+        if duplicate_index == -1:
+            kept.append(box)
+            continue
+
+        existing = kept[duplicate_index]
+        # Fingerprints strip fillers and spaces, so truncation detection must
+        # compare the whitespace-free *full* text (fillers intact): a band read
+        # cut mid-filler is a prefix of the fuller frame read.
+        compact = re.sub(r"\s+", "", box.text).lower()
+        existing_compact = re.sub(r"\s+", "", existing.text).lower()
+        if len(compact) > len(existing_compact) and existing_compact in compact:
+            kept[duplicate_index] = box          # fuller reading supersedes the truncation
+        elif len(compact) == len(existing_compact) and box.conf > existing.conf:
+            kept[duplicate_index] = box
+        # otherwise the already-kept reading stands
+    return kept
+
+
 def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> List[Dict[str, Any]]:
     boxes = []
     for bbox, text, conf in ocr_results:
@@ -691,6 +980,7 @@ def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> Lis
     if not boxes:
         return []
 
+    boxes = _dedupe_ocr_boxes(boxes)
     lines = _group_lines(boxes)
     parts: List[str] = []
     pos = 0
@@ -709,6 +999,9 @@ def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> Lis
     full_text = "".join(parts)
 
     spans = pii.find_pii(full_text, ner=_model_manager.ner)
+    # Spatial fallback for the second printed copy of a passport number (the
+    # upper-right corner of the data page, away from its label).
+    spans.extend(_passport_number_zone_spans(lines, spans, width, height))
 
     detections: List[Dict[str, Any]] = []
     for span in spans:
@@ -719,18 +1012,15 @@ def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> Lis
             first, last = hit[0], hit[-1]
             left = _sub_polygon(first, max(0, span.start - first.start), first.end - first.start)
             right = _sub_polygon(last, 0, min(span.end, last.end) - last.start)
-            poly = [left[0], right[1], right[2], left[3]]
-            poly = _expand_polygon(poly, ratio_h=0.02, ratio_w=0.005)
-            polygon = [[_clamp(int(round(x)), 0, width), _clamp(int(round(y)), 0, height)] for x, y in poly]
-            
+            poly = _expand_polygon([left[0], right[1], right[2], left[3]], ratio_h=0.02, ratio_w=0.005)
+            polygon = _clamp_polygon(poly, width, height)
+
             if M_inv is not None:
                 pts = np.array(polygon, dtype=np.float32).reshape(-1, 1, 2)
-                orig_pts = cv2.transform(pts, M_inv)
-                polygon = orig_pts.reshape(-1, 2).astype(np.int32).tolist()
+                # Deskewing rotates the coordinates back; clamp them to the frame again.
+                polygon = _clamp_polygon(cv2.transform(pts, M_inv).reshape(-1, 2), width, height)
 
-            xs = [p[0] for p in polygon]
-            ys = [p[1] for p in polygon]
-            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+            x1, y1, x2, y2 = _polygon_bbox(polygon)
             if (x2 - x1) <= 2 or (y2 - y1) <= 2:
                 continue
             ocr_conf = sum(b.conf for b in hit) / len(hit)
@@ -747,9 +1037,32 @@ def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> Lis
     return detections
 
 
+def _enhance_contrast(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Gentle CLAHE contrast enhancement in LAB colour space.
+
+    Passports / ID cards are printed on textured, guilloche-patterned stock and
+    photographed under uneven light. Stretching only the L channel's *local*
+    contrast lifts the print without binarising the image - a hard THRESH_OTSU
+    threshold would destroy the anti-aliased glyph edges that EasyOCR and DocTR
+    recognise most reliably, so it is deliberately avoided.
+    """
+    if img_bgr is None or img_bgr.size == 0 or img_bgr.ndim != 3:
+        return img_bgr
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_channel = clahe.apply(l_channel)
+    return cv2.cvtColor(cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
+
+
 def preprocess_for_ocr(img_bgr: np.ndarray):
     """
-    Attempts to deskew the image based on MRZ region.
+    Prepares the frame for OCR: gentle LAB-CLAHE contrast enhancement plus an
+    MRZ-based deskew. The bottom band is returned as a separate black-hat crop
+    (robust against guilloche patterns); the OCR frame itself is never
+    binarised.
+
     Returns (deskewed_gray, blackhat_bottom, y_offset, M_inv).
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -770,6 +1083,10 @@ def preprocess_for_ocr(img_bgr: np.ndarray):
     minVal, maxVal = np.min(gradX), np.max(gradX)
     if maxVal > minVal:
         gradX = (255 * ((gradX - minVal) / (maxVal - minVal))).astype("uint8")
+    else:
+        # A perfectly flat image (no gradients at all) must still yield a uint8
+        # frame: THRESH_OTSU below rejects float input.
+        gradX = np.zeros_like(gradX, dtype=np.uint8)
     
     gradX = cv2.morphologyEx(gradX, cv2.MORPH_CLOSE, rectKernel)
     thresh = cv2.threshold(gradX, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
@@ -803,7 +1120,9 @@ def preprocess_for_ocr(img_bgr: np.ndarray):
         img_bgr = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         M_inv = cv2.getRotationMatrix2D(center, -angle, 1.0)
 
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # Gentle LAB-space CLAHE: lifts the print contrast on textured passport
+    # stock without destructive binarisation (see _enhance_contrast).
+    gray = cv2.cvtColor(_enhance_contrast(img_bgr), cv2.COLOR_BGR2GRAY)
     
     # Extract bottom 35% for MRZ BlackHat processing (robust against Guilloche patterns)
     y_offset = int(h * 0.65)
@@ -821,6 +1140,10 @@ def _run_easyocr_pipeline(image: np.ndarray, width: int, height: int, is_crop: b
     mag_ratio = 1.5 if longest < 1280 else 1.0
     
     if is_crop:
+        # Layout-block crops bypass preprocess_for_ocr; the same gentle CLAHE
+        # enhancement is applied here so recall stays uniform across engines.
+        if image.ndim == 3:
+            image = _enhance_contrast(image)
         ocr_results = ocr_reader.readtext(
             image,
             detail=1,
@@ -873,7 +1196,7 @@ def _run_easyocr_pipeline(image: np.ndarray, width: int, height: int, is_crop: b
 def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
     paddle = _model_manager.paddle_ocr_reader
     if paddle is None:
-        print("[ML-Pipeline] PaddleOCR unavailable, falling back to EasyOCR.")
+        logger.warning("PaddleOCR unavailable; falling back to EasyOCR.")
         return _run_easyocr_pipeline(image, width, height, is_crop)
     
     def _parse_paddle_results(results):
@@ -910,45 +1233,68 @@ def _run_paddleocr_pipeline(image: np.ndarray, width: int, height: int, is_crop:
     return _ocr_pii_detections(ocr_results, width, height)
 
 
+def _doctr_pages_to_ocr_results(pages, img_w: int, img_h: int):
+    """
+    Converts docTR result pages into (polygon, text, confidence) tuples.
+
+    docTR nests one object per *word* (blocks -> lines -> words) with
+    normalised geometry. Each word is emitted with its own polygon - exactly
+    like EasyOCR's boxes - so ``_ocr_pii_detections`` rebuilds the
+    reading-order line ("07 Aug 1999" instead of "07", "Aug", "1999") and maps
+    a character span back to the precise word polygons it covers.
+    """
+    results: List[Tuple[List[List[float]], str, float]] = []
+    for page in pages:
+        for block in page.blocks:
+            for line in block.lines:
+                for word in line.words:
+                    value = str(word.value or "")
+                    if not value.strip():
+                        continue
+                    # docTR geometry is normalised to the page (0..1) and the
+                    # page *is* the image handed to the model, so the pixel
+                    # position is the fraction times the image size.
+                    (x1, y1), (x2, y2) = word.geometry
+                    polygon = [
+                        [x1 * img_w, y1 * img_h],
+                        [x2 * img_w, y1 * img_h],
+                        [x2 * img_w, y2 * img_h],
+                        [x1 * img_w, y2 * img_h],
+                    ]
+                    results.append((polygon, value, float(word.confidence)))
+    return results
+
+
 def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: bool = False) -> List[Dict[str, Any]]:
+    # Same cached singleton as the layout stage (_model_manager.doctr_reader):
+    # both engines share docTR's model zoo, so nothing is re-instantiated and
+    # no redundant preprocessing pass runs here.
     doctr = _model_manager.doctr_reader
     if doctr is None:
-        print("[ML-Pipeline] DocTR unavailable, falling back to EasyOCR.")
+        logger.warning("DocTR unavailable; falling back to EasyOCR.")
         return _run_easyocr_pipeline(image, width, height, is_crop)
-        
+
     from doctr.io import DocumentFile
-    
+
     def _run_doctr_on_img(img_array):
         _, encoded_image = cv2.imencode('.png', img_array)
         doc = DocumentFile.from_images([encoded_image.tobytes()])
         result = doctr(doc)
-        res_list = []
         img_h, img_w = img_array.shape[:2]
-        for page in result.pages:
-            page_h, page_w = page.dimensions
-            for block in page.blocks:
-                for line in block.lines:
-                    text = " ".join(word.value for word in line.words)
-                    if not text.strip(): continue
-                    
-                    if text.count('<') >= 2:
-                        text = text.replace(" ", "")
-                        
-                    conf = sum(word.confidence for word in line.words) / len(line.words)
-                    xmin, ymin = line.geometry[0]
-                    xmax, ymax = line.geometry[1]
-                    bbox = [[xmin*page_w, ymin*page_h], [xmax*page_w, ymin*page_h], [xmax*page_w, ymax*page_h], [xmin*page_w, ymax*page_h]]
-                    res_list.append((bbox, text, conf))
-        return res_list
-        
+        return _doctr_pages_to_ocr_results(result.pages, img_w, img_h)
+
     if is_crop:
+        # Layout-block crops bypass preprocess_for_ocr; apply the same gentle
+        # CLAHE enhancement so recall stays uniform across engines.
+        if image.ndim == 3:
+            image = _enhance_contrast(image)
         ocr_results = _run_doctr_on_img(image)
         return _ocr_pii_detections(ocr_results, width, height)
-    
+
     ocr_image, mrz_crop, y_offset, M_inv = preprocess_for_ocr(image)
-    
+
     ocr_results = _run_doctr_on_img(ocr_image)
-    
+
     if mrz_crop is not None and mrz_crop.size > 0:
         mrz_results = _run_doctr_on_img(mrz_crop)
         for bbox, text, conf in mrz_results:
@@ -958,14 +1304,206 @@ def _run_doctr_pipeline(image: np.ndarray, width: int, height: int, is_crop: boo
     return _ocr_pii_detections(ocr_results, width, height, M_inv)
 
 
-def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_score: float = None) -> dict:
-    if crop_img is None or crop_img.size == 0:
-        return {"action": "rejected", "confidence": 0.0, "unknown_prob": 1.0, "reason": "empty crop"}
+# DocLayNet-style classes returned by docTR's layout model that contain no text:
+# OCR is not worth running inside those regions, everything else is kept (page
+# headers/footers routinely carry names and document numbers).
+_NON_TEXT_LAYOUT_CLASSES = {"picture", "figure", "image", "graphic"}
 
+# The LW-DETR layout model is trained on modern office documents and regularly
+# labels an entire ID card / passport / photographed form as "Picture".
+# Trusting that exclusion there would delete every field printed on the card,
+# so it is bypassed when the picture regions cover a suspicious share of the
+# page or when the model found almost no text blocks at all - both typical for
+# camera-scanned identity documents.
+PICTURE_AREA_BYPASS_RATIO = 0.35
+MIN_LAYOUT_TEXT_BLOCKS = 3
+
+
+def _layout_region_blocks(page_prediction: Dict[str, Any],
+                          width: int, height: int,
+                          min_size: int = 10,
+                          include_non_text: bool = False) -> Tuple[List[List[int]], float]:
+    """
+    Converts one page of an LW-DETR layout prediction into pixel rectangles.
+
+    The predictor yields ``{"class_names": [...], "boxes": ndarray(N,4), "scores": [...]}``
+    with boxes normalised to [x1, y1, x2, y2] in 0..1. Returns
+    ``(blocks, picture_area_ratio)``: ``blocks`` holds the clamped regions
+    (non-text classes only when ``include_non_text`` is set) and
+    ``picture_area_ratio`` the share of the page covered by Picture / Figure
+    regions, which drives the bypass policy below. Degenerate boxes are ignored.
+    """
+    class_names = page_prediction.get("class_names") or []
+    boxes = page_prediction.get("boxes")
+    if boxes is None:
+        return [], 0.0
+
+    blocks: List[List[int]] = []
+    picture_area = 0.0
+    page_area = float(max(1, width) * max(1, height))
+    for name, box in zip(class_names, boxes):
+        is_non_text = str(name).strip().lower() in _NON_TEXT_LAYOUT_CLASSES
+        x1, y1, x2, y2 = (float(v) for v in np.asarray(box).flatten()[:4])
+        bx1 = _clamp(int(round(x1 * width)), 0, width)
+        by1 = _clamp(int(round(y1 * height)), 0, height)
+        bx2 = _clamp(int(round(x2 * width)), 0, width)
+        by2 = _clamp(int(round(y2 * height)), 0, height)
+        if bx2 - bx1 <= min_size or by2 - by1 <= min_size:
+            continue
+        if is_non_text:
+            picture_area += (bx2 - bx1) * (by2 - by1) / page_area
+            if not include_non_text:
+                continue
+        blocks.append([bx1, by1, bx2, by2])
+    return blocks, min(1.0, picture_area)
+
+
+def _layout_blocks_from_prediction(page_prediction: Dict[str, Any],
+                                   width: int, height: int,
+                                   min_size: int = 10) -> List[List[int]]:
+    """Text blocks of one layout page (raw converter; policy in _layout_blocks_with_policy)."""
+    return _layout_region_blocks(page_prediction, width, height, min_size)[0]
+
+
+def _layout_blocks_with_policy(predictions: List[Dict[str, Any]],
+                               width: int, height: int) -> List[List[int]]:
+    """
+    Applies the Picture/Figure exclusion policy to a whole page's predictions.
+
+    Non-text regions are dropped *only* when the layout looks like a normal
+    multi-block document. A page whose picture share exceeds
+    PICTURE_AREA_BYPASS_RATIO, or which yields fewer than
+    MIN_LAYOUT_TEXT_BLOCKS text blocks, is treated as an ID card / passport /
+    photographed form: every region is then kept so OCR still reads the whole
+    card.
+    """
+    text_blocks: List[List[int]] = []
+    picture_area = 0.0
+    for prediction in predictions:
+        blocks, area = _layout_region_blocks(prediction, width, height)
+        text_blocks.extend(blocks)
+        picture_area += area
+
+    if picture_area > PICTURE_AREA_BYPASS_RATIO or len(text_blocks) < MIN_LAYOUT_TEXT_BLOCKS:
+        all_blocks: List[List[int]] = []
+        for prediction in predictions:
+            all_blocks.extend(
+                _layout_region_blocks(prediction, width, height, include_non_text=True)[0]
+            )
+        if all_blocks:
+            logger.info(
+                "docTR layout: bypassing the Picture/Figure exclusion "
+                "(picture area %.0f%%, %d text block(s)) - reading every region "
+                "so ID-card / passport text is not dropped.",
+                picture_area * 100.0, len(text_blocks),
+            )
+        return all_blocks
+    return text_blocks
+
+
+def _doctr_layout_blocks(image: np.ndarray) -> List[List[int]]:
+    """Detects the text-bearing page blocks of ``image`` with docTR's layout model."""
+    model = _model_manager.doctr_layout_model
+    if model is None:
+        return []
+
+    try:
+        from doctr.io import DocumentFile
+
+        _, encoded = cv2.imencode('.png', image)
+        height, width = image.shape[:2]
+        pages = model(DocumentFile.from_images([encoded.tobytes()]))
+    except Exception as exc:
+        logger.warning("docTR layout detection failed: %s", exc)
+        return []
+
+    predictions = [page for page in pages if isinstance(page, dict)]
+    return _layout_blocks_with_policy(predictions, width, height)
+
+
+def _suppressed_by_plate(text_det: Dict[str, Any],
+                         plate_dets: List[Dict[str, Any]],
+                         min_plate_score: float = PLATE_CASCADE_BELOW) -> bool:
+    """
+    True when a text detection is really the plate's own characters.
+
+    Only a *confident* plate may absorb the text detections that overlap it. The
+    plate model also fires on formatted numbers (a dotted IP address, a card
+    number), and those marginal boxes must not swallow the PII labels sitting
+    inside them: the region would still be masked by the plate, but the entity
+    type would be reported as "licence plate" instead of "IP address".
+    """
+    return any(
+        float(plate.get("score", 0.0)) >= min_plate_score
+        and _iou(text_det.get("bbox", [0, 0, 0, 0]), plate.get("bbox", [0, 0, 0, 0])) > 0.5
+        for plate in plate_dets
+    )
+
+
+def _text_fingerprint(value: str) -> str:
+    """Lower-cased alphanumeric fingerprint used to compare two OCR readings."""
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _dedupe_text_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Drops text detections that describe the same characters twice.
+
+    The OCR stage reads the document twice (whole frame + bottom MRZ band), so a
+    line inside that band comes back twice with slightly different confidences
+    and boxes. Two detections count as duplicates when their boxes overlap
+    strongly *and* their recognised text agrees; the higher-scoring one is kept.
+    """
+    kept: List[Dict[str, Any]] = []
+    for det in detections:
+        if det.get("type") != "text":
+            kept.append(det)
+            continue
+
+        fingerprint = _text_fingerprint(det.get("text", ""))
+        match_index = -1
+        for index, existing in enumerate(kept):
+            if existing.get("type") != "text":
+                continue
+            if _iou(det.get("bbox", [0, 0, 0, 0]), existing.get("bbox", [0, 0, 0, 0])) < 0.55:
+                continue
+            other = _text_fingerprint(existing.get("text", ""))
+            if fingerprint and other and (fingerprint in other or other in fingerprint):
+                match_index = index
+                break
+
+        if match_index == -1:
+            kept.append(det)
+        elif float(det.get("score", 0.0)) > float(kept[match_index].get("score", 0.0)):
+            kept[match_index] = det
+    return kept
+
+
+def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_score: float = None) -> dict:
+    """
+    Second-stage validation of a low-confidence crop by the Imajev typed-decision engine.
+
+    Failure policy: the only outcome that drops a detection is an explicit model
+    *rejection*. If the validator itself fails (missing engine, decoding issue, ...)
+    the crop is kept, because silently discarding a real face / plate / line of text
+    would leave sensitive content unmasked — the worst possible failure for a
+    privacy tool.
+    """
+    detector_score = round(float(initial_score), 3) if initial_score is not None else None
+    if crop_img is None or crop_img.size == 0:
+        return {
+            "action": "error",
+            "confidence": 0.0,
+            "unknown_prob": 1.0,
+            "reason": "empty crop",
+            "detector_score": detector_score,
+        }
+
+    entity_fa = {"plate": "پلاک", "face": "چهره"}.get(entity_type, "متن")
     try:
         vlm = _model_manager.imajev_model
         if not vlm:
-            raise RuntimeError("Imajev VLM engine is not available")
+            raise RuntimeError("Imajev engine is not available")
 
         if entity_type == "plate":
             options = ["valid license plate", "printed text", "graphic/barcode"]
@@ -1004,6 +1542,11 @@ def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_s
                 "confidence": round(target_score, 3),
                 "unknown_prob": round(unknown_prob, 3),
                 "reason": "model decision",
+                "detector_score": detector_score,
+                "message": (
+                    f"❌ Imajev: کادر {entity_fa} نامعتبر ارزیابی شد "
+                    f"(اطمینان {target_score * 100:.1f}٪ / عدم‌قطعیت {unknown_prob * 100:.1f}٪) و حذف گردید."
+                ),
                 "scores": {k: round(v, 3) for k, v in scores.items()}
             }
 
@@ -1012,15 +1555,25 @@ def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_s
             "confidence": round(target_score, 3),
             "unknown_prob": round(unknown_prob, 3),
             "reason": "model decision",
+            "detector_score": detector_score,
+            "message": (
+                f"✅ Imajev: کادر {entity_fa} تأیید شد "
+                f"(اطمینان {target_score * 100:.1f}٪ / عدم‌قطعیت {unknown_prob * 100:.1f}٪)."
+            ),
             "scores": {k: round(v, 3) for k, v in scores.items()}
         }
     except Exception as e:
-        print(f"[ML-Pipeline] Imajev validation failed for {entity_type}: {e}")
+        logger.warning("Imajev validation failed for %s: %s", entity_type, e)
         return {
-            "action": "rejected",
+            "action": "error",
             "confidence": 0.0,
             "unknown_prob": 1.0,
-            "reason": f"model error: {e}"
+            "reason": f"validator error: {e}",
+            "detector_score": detector_score,
+            "message": (
+                f"⚠️ Imajev: اعتبارسنجی کادر {entity_fa} ممکن نشد ({e})؛ "
+                "عنصر بدون فیلتر ثانویه نگه داشته شد."
+            ),
         }
 
 
@@ -1032,9 +1585,32 @@ def analyze_image_entities(
     use_imajev: bool = False
 ) -> Dict[str, Any]:
     """
-    Analyzes an input image to detect sensitive entities.
-    Now supports modular dynamic routing based on requested OCR and Layout engines,
-    and optional Imajev VLM reasoning and crop validation.
+    Analyzes an input image and returns every sensitive entity with its geometry.
+
+    Pipeline: YOLO face detection -> YOLO plate detection (with an OCR/Imajev
+    confidence cascade) -> OCR text recognition (EasyOCR / PaddleOCR / DocTR)
+    -> PII recognition over the reconstructed text lines -> optional Imajev
+    typed-decision routing and crop validation.
+
+    Args:
+        image_input: Raw bytes, path, or an already decoded BGR ndarray.
+        conf_threshold: Minimum detector confidence (also the face/plate floor).
+        ocr_engine: 'easyocr' | 'paddleocr' | 'doctr' (unknown values fall back
+                    to EasyOCR; a missing engine degrades to EasyOCR as well).
+        layout_engine: 'regex' (reconstruct lines ourselves) | 'doctr_layout'
+                       (docTR LW-DETR page layout, works on Windows) |
+                       'layoutparser' (Detectron2 blocks; needs detectron2).
+        use_imajev: Enables the Imajev reasoning pass: scene routing (skip OCR on
+                    outdoor photos) plus second-stage validation of low-confidence
+                    crops. Validation failures never drop a detection.
+
+    Returns:
+        {
+            "status": "success",
+            "image_dimensions": {"width": int, "height": int},
+            "detections": [{"id", "type", "bbox", "polygon", "score", ...}, ...],
+            "imajev_logs": [json-stringified decision records, ...]
+        }
     """
     image = _load_image(image_input)
     if image.ndim == 2:
@@ -1042,6 +1618,11 @@ def analyze_image_entities(
     elif image.shape[2] == 4:
         image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
     height, width = image.shape[:2]
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"Image is too large ({width}x{height} px). "
+            f"The maximum supported resolution is {MAX_IMAGE_PIXELS // 1_000_000} megapixels."
+        )
 
     detections: List[Dict[str, Any]] = []
     imajev_logs: List[str] = []
@@ -1083,7 +1664,7 @@ def analyze_image_entities(
                         "reason": "model decision",
                         "scores": {k: round(v, 3) for k, v in scores.items()}
                     }))
-                    print(f"[ML-Pipeline] {log_msg}")
+                    logger.info("%s", log_msg)
                 else:
                     skip_ocr = False
                     log_msg = f"🔍 Imajev: تصویر به عنوان سند یا کارت شناسایی طبقه‌بندی شد ({doc_prob*100:.1f}٪)؛ پردازش متن و OCR فعال است."
@@ -1096,7 +1677,7 @@ def analyze_image_entities(
                         "reason": "model decision",
                         "scores": {k: round(v, 3) for k, v in scores.items()}
                     }))
-                    print(f"[ML-Pipeline] {log_msg}")
+                    logger.info("%s", log_msg)
             else:
                 raise RuntimeError("Imajev model instance unavailable")
         except Exception as e:
@@ -1109,8 +1690,15 @@ def analyze_image_entities(
                 "message": err_msg,
                 "reason": f"exception: {str(e)}"
             }))
-            print(f"[ML-Pipeline] {err_msg}")
+            logger.warning("%s", err_msg)
 
+
+    # Licence plates are verified strictly on document scans: the plate model is
+    # unreliable there (it fires at 0.6-0.8 on ordinary text), whereas on a
+    # photograph an unreadable plate crop is normal and must be kept.
+    _gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    _white_ratio = float(np.mean(_gray > 200))
+    document_like = _white_ratio >= DOCUMENT_WHITE_RATIO and not skip_ocr
 
     # 1. Faces -------------------------------------------------------------- #
     try:
@@ -1152,7 +1740,7 @@ def analyze_image_entities(
                         "score": round(score, 2),
                     })
     except Exception as e:
-        print(f"[ML-Pipeline] Face detection warning: {e}")
+        logger.warning("Face detection skipped: %s", e)
 
     # 2. Licence plates ----------------------------------------------------- #
     try:
@@ -1175,24 +1763,36 @@ def analyze_image_entities(
                     if not (0.8 <= aspect <= 8.0):
                         continue
 
-                    if score < PLATE_CASCADE_BELOW:
-                        crop = image[bx[1]:bx[3], bx[0]:bx[2]]
-                        if crop.size > 0 and use_imajev:
-                            result = _validate_crop_with_imajev(crop, "plate", initial_score=score)
-                            result["entity"] = "plate"
-                            if result["action"] == "approved":
-                                result["id"] = len(detections) + 1
-                            imajev_logs.append(json.dumps(result))
-                            if result["action"] == "rejected":
-                                continue
-                        if crop.shape[0] < 32:
-                            scale = 32.0 / crop.shape[0]
-                            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                        plate_ocr = _model_manager.ocr_reader.readtext(crop, detail=1, paragraph=False)
-                        plate_text = "".join(str(item[1]) for item in plate_ocr)
-                        if not _plate_text_is_valid(plate_text):
+                    # Every plate candidate is verified, whatever its confidence: the
+                    # detector also fires at 0.6-0.8 on ordinary document text, so a
+                    # high score alone is not evidence of a plate.
+                    crop = image[bx[1]:bx[3], bx[0]:bx[2]]
+                    if crop.size == 0:
+                        continue
+                    if use_imajev:
+                        result = _validate_crop_with_imajev(crop, "plate", initial_score=score)
+                        result["entity"] = "plate"
+                        imajev_logs.append(json.dumps(result))
+                        if result["action"] == "rejected":
+                            continue
+
+                    # OCR confirmation: on a document the crop must actually read like
+                    # a plate; on a photograph the lenient test applies and an
+                    # unreadable crop is kept. When no OCR engine could be
+                    # initialized the candidate is kept (fail open).
+                    ocr_reader = _model_manager.ocr_reader
+                    if ocr_reader is not None:
+                        plate_text = _read_plate_text(ocr_reader, crop)
+                        verified = (_plate_text_looks_like_plate(plate_text) if document_like
+                                    else _plate_text_is_valid(plate_text))
+                        if not verified:
                             if use_imajev:
-                                imajev_logs.append(json.dumps({"entity": "plate", "action": "rejected", "reason": "invalid OCR pattern", "message": "❌ Imajev/OCR: کاراکترهای پلاک با الگوی معتبر همخوانی نداشت و حذف شد"}))
+                                imajev_logs.append(json.dumps({
+                                    "entity": "plate",
+                                    "action": "rejected",
+                                    "reason": "invalid OCR pattern",
+                                    "message": "❌ Imajev/OCR: محتوای کادر با الگوی پلاک همخوانی نداشت و حذف شد",
+                                }))
                             continue
 
                     detections.append({
@@ -1202,7 +1802,7 @@ def analyze_image_entities(
                         "score": round(score, 2),
                     })
     except Exception as e:
-        print(f"[ML-Pipeline] Plate detection warning: {e}")
+        logger.warning("Plate detection skipped: %s", e)
 
     # 3. Dynamic OCR & Layout strategy -------------------------------------- #
     try:
@@ -1210,7 +1810,7 @@ def analyze_image_entities(
         if not skip_ocr and layout_engine == 'layoutparser':
             lp_model = _model_manager.layout_parser
             if lp_model is None:
-                print("[ML-Pipeline] LayoutParser not available, falling back to regex.")
+                logger.info("LayoutParser not available, falling back to regex layout.")
                 layout_engine = 'regex'
             else:
                 layout = lp_model.detect(image)
@@ -1219,11 +1819,18 @@ def analyze_image_entities(
                     if block.type in ["Text", "Title", "List"]:
                         x1, y1, x2, y2 = block.coordinates
                         lp_blocks.append([int(x1), int(y1), int(x2), int(y2)])
+        elif not skip_ocr and layout_engine == 'doctr_layout':
+            lp_blocks = _doctr_layout_blocks(image)
+            if lp_blocks:
+                logger.info("docTR layout: %d text region(s) detected.", len(lp_blocks))
+            else:
+                logger.info("docTR layout found no text regions, falling back to regex layout.")
+                layout_engine = 'regex'
 
         text_dets = []
         if skip_ocr:
             pass
-        elif layout_engine == 'layoutparser' and lp_blocks:
+        elif layout_engine in ('layoutparser', 'doctr_layout') and lp_blocks:
             # Run OCR ONLY on detected layout blocks
             for block in lp_blocks:
                 bx1, by1, bx2, by2 = block
@@ -1256,9 +1863,13 @@ def analyze_image_entities(
             else: # easyocr
                 text_dets = _run_easyocr_pipeline(image, width, height)
 
-        plates = [d["bbox"] for d in detections if d["type"] == "plate"]
+        # The EasyOCR stage reads the document twice (full frame + bottom MRZ band),
+        # so ordinary lines inside that band arrive twice; keep one of each pair.
+        text_dets = _dedupe_text_detections(text_dets)
+
+        plates = [d for d in detections if d["type"] == "plate"]
         for d in text_dets:
-            if any(_iou(d["bbox"], p) > 0.5 for p in plates):
+            if _suppressed_by_plate(d, plates):
                 continue
             
             score = d.get("score", 1.0)
@@ -1276,11 +1887,12 @@ def analyze_image_entities(
                         continue
                     
             detections.append(d)
-    except ValueError as ve:
-        raise ve
+    except ValueError:
+        raise
     except Exception as e:
-        print(f"[ML-Pipeline] Text OCR detection warning: {e}")
-        # Allow other engines to fail gracefully unless it's a direct ValueError from our strict handling
+        logger.warning("Text OCR stage skipped: %s", e)
+        # Any other engine failure is tolerated: faces and plates still get returned
+        # even when the OCR stage could not run.
 
     if use_imajev and len(imajev_logs) == 1:
         imajev_logs.append(json.dumps({"entity": "system", "action": "info", "message": "✨ Imajev: همه عناصر شناسایی‌شده دارای ضریب اطمینان بالا بودند و نیازی به فیلتر ثانویه نبود."}))

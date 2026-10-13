@@ -1,16 +1,29 @@
-django>=5.0,<7.0
-ultralytics>=8.0.0
-easyocr>=1.7.0
-opencv-python>=4.8.0
-numpy>=1.24.0
+# Privacy Auto-Anonymizer - Python dependencies
+# Install inside a virtual environment:  pip install -r requirements.txt
 
-# Optional (improve PII recall; the pipeline works without them):
-#   phonenumbers  - Google libphonenumber validation for international phone numbers
-#   transformers  - BERT NER (dslim/bert-base-NER) for person / location names
-phonenumbers>=8.13
-transformers>=4.40
-paddleocr>=2.7.0
-paddlepaddle>=2.6.0
-python-doctr>=0.8.1
-tf2onnx>=1.16.1
-layoutparser>=0.3.4
+# --- Core runtime (always required) ---------------------------------------- #
+django>=5.0,<7.0
+numpy>=1.24
+opencv-python>=4.8.0
+pillow>=10.0
+
+# --- Detection + OCR pipeline ---------------------------------------------- #
+ultralytics>=8.0.0        # YOLOv8: face detector + licence-plate detector
+easyocr>=1.7.0            # default OCR engine (pulls torch + torchvision)
+
+# --- PII recognizers ------------------------------------------------------- #
+phonenumbers>=8.13        # Google libphonenumber validation for phone numbers
+transformers>=4.40        # dslim/bert-base-NER person-name model (optional at runtime)
+
+# --- Optional OCR / layout engines ----------------------------------------- #
+# The UI disables the corresponding selector entry when one of these is missing
+# and the pipeline silently falls back to EasyOCR / the regex layout engine.
+paddleocr>=2.7.0          # alternative OCR engine (PaddleOCR)
+paddlepaddle>=2.6.0       # PaddleOCR runtime
+python-doctr>=1.0,<2.0    # alternative OCR engine + the LW-DETR layout model
+                          # (validated on 1.1.0; the API used here is 1.x)
+
+# LayoutParser requires Detectron2, which has no official Windows wheels; the
+# pipeline works without it (upstream options kept here for reference):
+# layoutparser>=0.3.4
+# tf2onnx>=1.16.1

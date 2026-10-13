@@ -1,12 +1,11 @@
 from django.contrib import admin
 from django.urls import path, include
-from django.conf import settings
-from django.conf.urls.static import static
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('', include('anonymizer.urls')),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATICFILES_DIRS[0])
+# Static files are served by django.contrib.staticfiles while DEBUG is on; there
+# is no need for an extra django.conf.urls.static() route, and nothing is served
+# from here in production (run `collectstatic` instead).

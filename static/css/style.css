@@ -1,1 +1,216 @@
-/* Static CSS assets directory */
+/* ==========================================================================
+   Privacy Auto-Anonymizer - global stylesheet
+   --------------------------------------------------------------------------
+   Everything is served locally: Tailwind provides the utility classes and this
+   file adds the design tokens, the self-hosted fonts and the few custom
+   components that are easier to express in plain CSS (canvas grid, scrollbars,
+   HUD badge transitions). No CDN request is needed at runtime.
+   ========================================================================== */
+
+/* --- Self-hosted fonts --------------------------------------------------- */
+/* Vazirmatn carries the Persian/Arabic script ... */
+@font-face {
+    font-family: 'Vazirmatn';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('../fonts/vazirmatn-arabic-400.woff2') format('woff2');
+    unicode-range: U+0600-06FF, U+0750-077F, U+0870-088E, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF, U+200C-200D;
+}
+@font-face {
+    font-family: 'Vazirmatn';
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url('../fonts/vazirmatn-arabic-500.woff2') format('woff2');
+    unicode-range: U+0600-06FF, U+0750-077F, U+0870-088E, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF, U+200C-200D;
+}
+@font-face {
+    font-family: 'Vazirmatn';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('../fonts/vazirmatn-arabic-600.woff2') format('woff2');
+    unicode-range: U+0600-06FF, U+0750-077F, U+0870-088E, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF, U+200C-200D;
+}
+@font-face {
+    font-family: 'Vazirmatn';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('../fonts/vazirmatn-arabic-700.woff2') format('woff2');
+    unicode-range: U+0600-06FF, U+0750-077F, U+0870-088E, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF, U+200C-200D;
+}
+
+/* ... while Inter handles Latin text, digits and code snippets. */
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('../fonts/inter-latin-400.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url('../fonts/inter-latin-500.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('../fonts/inter-latin-600.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('../fonts/inter-latin-700.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+FEFF, U+FFFD;
+}
+
+/* Monospaced accents (terminal panel, score chips). */
+@font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('../fonts/jetbrains-mono-latin-400.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+20AC, U+2122, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('../fonts/jetbrains-mono-latin-700.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+20AC, U+2122, U+FEFF, U+FFFD;
+}
+
+/* --- Design tokens ------------------------------------------------------- */
+:root {
+    --surface: #09090b;
+    --surface-elevated: #121215;
+    --surface-card: #18181b;
+    --border-subtle: #27272a;
+    /* Lateral space reserved for the out-of-image HUD callout badges. */
+    --hud-badge-width: 134px;
+    --hud-gutter: 148px;
+}
+
+/* --- Base ---------------------------------------------------------------- */
+html {
+    color-scheme: dark;
+}
+
+body {
+    background-color: var(--surface);
+    color: #fafafa;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+}
+
+/* --- Scrollbars ---------------------------------------------------------- */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: var(--surface);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--border-subtle);
+    border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #3f3f46;
+}
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-subtle) var(--surface);
+}
+
+/* --- Workspace canvas ---------------------------------------------------- */
+.canvas-grid {
+    background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+    background-size: 20px 20px;
+}
+
+#canvasContainer {
+    /* The HUD badges are drawn beside the image, so the container reserves room
+       for them whenever the dropzone is wide enough; the script switches the
+       badges to "inside" placement on narrow screens. */
+    max-width: 100%;
+    transition: max-width 0.2s ease;
+}
+
+/* --- HUD callout badges -------------------------------------------------- */
+.hud-badge {
+    transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease,
+        background-color 0.15s ease;
+}
+.hud-badge:focus-visible {
+    outline: 2px solid #22d3ee;
+    outline-offset: 2px;
+}
+.hud-connector {
+    transition: opacity 0.15s ease;
+}
+
+/* --- Imajev two-column workspace ----------------------------------------- */
+/* The split class is applied by static/js/app.js when the Imajev terminal is
+   active. The vendored Tailwind JIT build generates the matching
+   lg:grid-cols-[1fr_340px] utility at runtime; this plain rule guarantees the
+   two-column layout (canvas | 340px terminal) on desktop even if that scan
+   misses the dynamically added class. */
+@media (min-width: 1024px) {
+    #workspaceGrid.imajev-grid-split {
+        grid-template-columns: minmax(0, 1fr) 340px;
+    }
+}
+
+/* --- Drag & drop highlight ---------------------------------------------- */
+#dropzoneContainer.drag-active {
+    border-color: #52525b;
+    background-color: rgba(24, 24, 27, 0.45);
+}
+
+/* --- Toast --------------------------------------------------------------- */
+#app-toast.toast-hidden {
+    transform: translate(-50%, 1.5rem);
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* --- Terminal log entries ----------------------------------------------- */
+.imajev-log-item {
+    animation: imajev-log-in 0.25s ease both;
+}
+@keyframes imajev-log-in {
+    from {
+        opacity: 0;
+        transform: translateY(6px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* --- Motion preferences -------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
