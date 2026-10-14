@@ -1355,3 +1355,111 @@ class ImajevPlateDecisionTests(SimpleTestCase):
 
         scene = next(entry for entry in logs if entry.get("entity") == "scene")
         self.assertEqual(scene["action"], "rejected")   # street scene -> OCR skipped
+
+
+# --------------------------------------------------------------------------- #
+# Split-box bilingual dates (ml_pipeline.py)                                  #
+# --------------------------------------------------------------------------- #
+
+class SplitDateStitchingTests(SimpleTestCase):
+    """Canadian passports print "14 JAN /JAN    13": OCR hands back two boxes."""
+
+    @staticmethod
+    def _results(year_text):
+        return [
+            ([[30, 300], [210, 300], [210, 330], [30, 330]], "14 JAN /JAN", 0.82),
+            ([[330, 302], [370, 302], [370, 328], [330, 328]], year_text, 0.71),
+        ]
+
+    def test_wide_gap_split_date_is_one_date_detection(self):
+        with mock.patch("anonymizer.ml_pipeline.ENABLE_NER", False):
+            detections = _ocr_pii_detections(self._results("13"), 900, 560)
+        dates = [d for d in detections if d["entity"] == "DATE"]
+        self.assertEqual(len(dates), 1)
+        self.assertEqual(dates[0]["text"], "14 JAN /JAN 13")
+        # The union redaction must cover both halves (gap and watermark included).
+        self.assertLessEqual(dates[0]["bbox"][0], 31)
+        self.assertGreaterEqual(dates[0]["bbox"][2], 369)
+
+    def test_second_bilingual_date_variant(self):
+        with mock.patch("anonymizer.ml_pipeline.ENABLE_NER", False):
+            detections = _ocr_pii_detections(self._results("23"), 900, 560)
+        dates = [d for d in detections if d["entity"] == "DATE"]
+        self.assertEqual([d["text"] for d in dates], ["14 JAN /JAN 23"])
+
+    def test_ocr_year_misreads_are_repaired_when_stitching(self):
+        with mock.patch("anonymizer.ml_pipeline.ENABLE_NER", False):
+            detections = _ocr_pii_detections(self._results("I3"), 900, 560)
+        dates = [d for d in detections if d["entity"] == "DATE"]
+        self.assertEqual([d["text"] for d in dates], ["14 JAN /JAN 13"])
+
+    def test_complete_single_box_year_misread_is_repaired(self):
+        results = [([[30, 300], [240, 300], [240, 330], [30, 330]], "14 JAN /JAN I3", 0.8)]
+        with mock.patch("anonymizer.ml_pipeline.ENABLE_NER", False):
+            detections = _ocr_pii_detections(results, 900, 560)
+        dates = [d for d in detections if d["entity"] == "DATE"]
+        self.assertEqual([d["text"] for d in dates], ["14 JAN /JAN 13"])
+
+    def test_value_row_under_a_date_header_is_collected_across_split_lines(self):
+        # The year sits far enough right that line grouping splits the row into
+        # separate lines; only the header-aware row collection can join them.
+        results = [
+            ([[30, 260], [300, 260], [300, 290], [30, 290]], "Date of birth / Date de naissance", 0.9),
+            ([[30, 300], [210, 300], [210, 330], [30, 330]], "14 JAN /JAN", 0.82),
+            ([[700, 302], [740, 302], [740, 328], [700, 328]], "13", 0.71),
+        ]
+        with mock.patch("anonymizer.ml_pipeline.ENABLE_NER", False):
+            detections = _ocr_pii_detections(results, 900, 560)
+        dob = [d for d in detections if d["entity"] == "DATE_OF_BIRTH"]
+        self.assertEqual([d["text"] for d in dob], ["14 JAN /JAN 13"])
+        self.assertGreaterEqual(dob[0]["bbox"][2], 739)
+
+
+# --------------------------------------------------------------------------- #
+# DP-Pix grid-level noise (filters.py)                                        #
+# --------------------------------------------------------------------------- #
+
+class DpPixGridLevelTests(SimpleTestCase):
+    """Noise is drawn per grid cell BEFORE the nearest-neighbour upsample, so
+    every b x b macro-pixel ends up one uniform noisy colour."""
+
+    @staticmethod
+    def _image():
+        rng = np.random.default_rng(9)
+        return rng.integers(0, 255, size=(64, 64, 3), dtype=np.uint8)
+
+    def test_macro_pixels_are_uniform_with_noise_enabled(self):
+        np.random.seed(5)
+        out = filters.dp_pix_filter(self._image(), pixel_size=16, noise_scale=10.0)
+        cells = []
+        for by in range(4):
+            for bx in range(4):
+                cell = out[by * 16:(by + 1) * 16, bx * 16:(bx + 1) * 16].reshape(-1, 3)
+                self.assertEqual(len(np.unique(cell, axis=0)), 1)
+                cells.append(tuple(out[by * 16, bx * 16]))
+        # The grid cells themselves must differ: one noise draw per cell.
+        self.assertGreater(len(set(cells)), 1)
+
+    def test_noise_actually_changes_the_grid(self):
+        np.random.seed(5)
+        noisy = filters.dp_pix_filter(self._image(), pixel_size=16, noise_scale=10.0)
+        clean = filters.dp_pix_filter(self._image(), pixel_size=16, noise_scale=0.0)
+        self.assertFalse(np.array_equal(noisy, clean))
+
+
+# --------------------------------------------------------------------------- #
+# Submission hygiene                                                          #
+# --------------------------------------------------------------------------- #
+
+class SubmissionHygieneTests(SimpleTestCase):
+    """The packaged project must not ship internal notes or a dev database."""
+
+    def test_internal_notes_and_dev_database_are_deleted_from_disk(self):
+        from pathlib import Path
+
+        from django.conf import settings
+
+        base = Path(settings.BASE_DIR)
+        self.assertFalse((base / "PROJECT_MEMORY.md").exists())
+        self.assertFalse((base / "db.sqlite3").exists())
+        self.assertFalse((base / "db.sqlite3-journal").exists())

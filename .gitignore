@@ -64,7 +64,3 @@ Thumbs.db
 # Project Scratch & Temp Files
 scratch/
 .tmp/
-
-# Internal developer notes (the scientific grounding in RESEARCH_PAPERS.md is
-# part of the submitted project and stays tracked)
-PROJECT_MEMORY.md
