@@ -214,3 +214,18 @@ body {
         transition-duration: 0.01ms !important;
     }
 }
+
+/* --- Terminal log messages (bidi-safe) ------------------------------------ */
+/* Log messages mix Persian prose with Latin tokens (OCR, MRZ, PII), numbers
+   and parenthesised percentages. app.js sets an explicit dir="rtl"/"ltr" per
+   message and wraps every technical run in <bdi>; these rules make the
+   isolation a documented contract instead of a per-site accident. */
+.imajev-log-message {
+    unicode-bidi: isolate;
+}
+.imajev-log-message bdi {
+    unicode-bidi: isolate;
+}
+#imajevLogContent {
+    min-height: 0;
+}

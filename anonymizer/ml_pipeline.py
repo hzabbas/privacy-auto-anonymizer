@@ -53,6 +53,30 @@ IMAJEV_REMOTE_COOLDOWN = int(os.environ.get("IMAJEV_REMOTE_COOLDOWN", "120"))
 # Page-layout model used by the 'doctr_layout' engine (DocLayNet classes).
 DOCTR_LAYOUT_ARCH = os.environ.get("DOCTR_LAYOUT_ARCH", "lw_detr_s")
 
+# --- Imajev scene gating and log labels ------------------------------------ #
+# Option labels are shared by the Imajev classifiers and by the terminal
+# distribution chips, so they stay short and complete (a label like
+# "Document / ID Card" instead of a sentence the UI would truncate mid-word).
+SCENE_OPTIONS = ("Document / ID Card", "Street / Vehicle Scene")
+PLATE_OPTIONS = ("License Plate", "Printed Text", "Graphic / Barcode")
+FACE_OPTIONS = ("Human Face / Portrait", "Illustration / Statue", "Background / Icon")
+TEXT_OPTIONS = ("Identity Field", "Boilerplate Text", "OCR Noise")
+# A scene counts as a flat document only when the classifier is this sure; the
+# plate stage then runs with a document prior (see the PLATE_SCENE_DOCUMENT_*).
+SCENE_DOCUMENT_GATE = 0.80
+SCENE_STREET_GATE = 0.20
+# On a high-confidence document scene a "plate" candidate can only be
+# plate-shaped text: the detector floor is raised and failed candidates are
+# suppressed silently (at most one aggregate info note reaches the terminal).
+PLATE_DOCUMENT_SCENE_MIN_CONFIDENCE = 0.80
+# Logit adjustment applied to plate verification inside a document scene, so a
+# document-text crop reads as printed text (>= 85%) instead of a plate (< 15%).
+PLATE_SCENE_DOCUMENT_PENALTY = 5.0
+PLATE_SCENE_DOCUMENT_TEXT_BOOST = 3.5
+# First-stage face detections below this score may be dropped on a secondary
+# rejection; higher-confidence faces are always kept (fail open on privacy).
+FACE_IMAJEV_DROP_SCORE = 0.60
+
 # Ensure UTF-8 output encoding across Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -255,6 +279,12 @@ class ImajevClassifier:
 
         plate_key = next((opt for opt in options if "license plate" in opt.lower()), None)
         if plate_key:
+            # Scene context: inside a high-confidence document scene the caller
+            # passes state {"scene": "document"} - a flat document cannot carry a
+            # vehicle plate, so plate evidence is down-weighted below printed
+            # text instead of scoring 100% on a passport number.
+            scene_is_document = isinstance(state, dict) and str(state.get("scene", "")).lower() == "document"
+
             ar = float(w) / max(float(h), 1.0)
             ar_score = 3.5 if 2.0 <= ar <= 5.5 else (1.5 if 1.5 <= ar <= 6.5 else -2.5)
 
@@ -270,6 +300,13 @@ class ImajevClassifier:
             z_plate = ar_score + char_score + (1.0 if contrast > 35 else -1.0)
             z_printed = (2.0 if ar < 1.8 or char_count > 10 else -1.0) + (1.5 if contrast > 20 else 0.0)
             z_barcode = (3.0 if barcode_tendency > 2.8 else -1.5)
+
+            if scene_is_document:
+                # Document prior (Bayesian-style logit shift): document text in a
+                # Document / ID Card scene must read as printed text (>= 85%) and
+                # never as "valid license plate".
+                z_plate -= PLATE_SCENE_DOCUMENT_PENALTY
+                z_printed += PLATE_SCENE_DOCUMENT_TEXT_BOOST
 
             logits_list = []
             for opt in options:
@@ -343,7 +380,7 @@ class ImajevClassifier:
                 "abstained": unknown_p > 0.4
             }
 
-        text_key = next((opt for opt in options if "identification text" in opt.lower() or "valid" in opt.lower()), None)
+        text_key = next((opt for opt in options if "identity" in opt.lower() or "identification" in opt.lower()), None)
         if text_key:
             _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             proj_y = np.sum(binary, axis=1)
@@ -358,7 +395,7 @@ class ImajevClassifier:
             for opt in options:
                 if opt == text_key:
                     logits_list.append(z_id_text)
-                elif "random" in opt.lower() or "background" in opt.lower():
+                elif "boilerplate" in opt.lower() or "background" in opt.lower() or "random" in opt.lower():
                     logits_list.append(z_bg_text)
                 else:
                     logits_list.append(z_garbled)
@@ -1479,9 +1516,20 @@ def _dedupe_text_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, 
     return kept
 
 
-def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_score: float = None) -> dict:
+def _validate_crop_with_imajev(
+    crop_img: np.ndarray,
+    entity_type: str,
+    initial_score: float = None,
+    scene: str = None,
+) -> dict:
     """
-    Second-stage validation of a low-confidence crop by the Imajev typed-decision engine.
+    Second-stage validation of a crop by the Imajev typed-decision engine.
+
+    ``scene`` carries the scene context established by the caller ("document" /
+    "street") and is forwarded to the engine as state, so a document scene can
+    apply its prior (plate evidence is down-weighted below printed text). The
+    caller in ``analyze_image_entities`` combines this verdict with the OCR check
+    and emits at most ONE log entry per candidate.
 
     Failure policy: the only outcome that drops a detection is an explicit model
     *rejection*. If the validator itself fails (missing engine, decoding issue, ...)
@@ -1506,17 +1554,18 @@ def _validate_crop_with_imajev(crop_img: np.ndarray, entity_type: str, initial_s
             raise RuntimeError("Imajev engine is not available")
 
         if entity_type == "plate":
-            options = ["valid license plate", "printed text", "graphic/barcode"]
-            target = "valid license plate"
+            options = list(PLATE_OPTIONS)
+            target = PLATE_OPTIONS[0]
         elif entity_type == "face":
-            options = ["human face", "illustration/statue", "background noise"]
-            target = "human face"
+            options = list(FACE_OPTIONS)
+            target = FACE_OPTIONS[0]
         else:
-            options = ["valid identification text", "random background text", "garbled ocr noise"]
-            target = "valid identification text"
+            options = list(TEXT_OPTIONS)
+            target = TEXT_OPTIONS[0]
 
+        state = {"scene": scene} if scene else None
         if hasattr(vlm, 'predict_typed'):
-            resp = vlm.predict_typed(crop_img, options=options)
+            resp = vlm.predict_typed(crop_img, options=options, state=state)
         elif callable(vlm):
             resp = vlm(crop_img, options=options)
         elif hasattr(vlm, 'predict'):
@@ -1601,8 +1650,10 @@ def analyze_image_entities(
                        (docTR LW-DETR page layout, works on Windows) |
                        'layoutparser' (Detectron2 blocks; needs detectron2).
         use_imajev: Enables the Imajev reasoning pass: scene routing (skip OCR on
-                    outdoor photos) plus second-stage validation of low-confidence
-                    crops. Validation failures never drop a detection.
+                    outdoor photos), scene-aware gating of plate candidates and
+                    second-stage validation of faces / crops. Validation failures
+                    never drop a detection; every evaluated candidate produces at
+                    most one log entry.
 
     Returns:
         {
@@ -1628,6 +1679,7 @@ def analyze_image_entities(
     imajev_logs: List[str] = []
 
     skip_ocr = False
+    scene_kind = None  # "document" / "street", once the scene classifier is sure
     if use_imajev:
         imajev_logs.append(json.dumps({
             "entity": "system",
@@ -1637,7 +1689,7 @@ def analyze_image_entities(
         try:
             vlm = _model_manager.imajev_model
             if vlm:
-                scene_options = ["Document or ID Card or Form", "Street scene or landscape or crowd"]
+                scene_options = list(SCENE_OPTIONS)
                 if hasattr(vlm, 'predict_typed'):
                     resp = vlm.predict_typed(image, options=scene_options)
                 elif callable(vlm):
@@ -1649,8 +1701,15 @@ def analyze_image_entities(
 
                 scores = resp.get("scores") or resp.get("probabilities") or {}
                 unknown_prob = float(resp.get("unknown_probability", resp.get("unknown_prob", 0.0)))
-                doc_prob = float(scores.get("Document or ID Card or Form", 0.0))
-                street_prob = float(scores.get("Street scene or landscape or crowd", 0.0))
+                doc_prob = float(scores.get(SCENE_OPTIONS[0], 0.0))
+                street_prob = float(scores.get(SCENE_OPTIONS[1], 0.0))
+
+                # Hard gate for the scene priors below: only a decisive
+                # classification may drive the document/plate policies.
+                if doc_prob >= SCENE_DOCUMENT_GATE and street_prob < SCENE_STREET_GATE:
+                    scene_kind = "document"
+                elif street_prob >= SCENE_DOCUMENT_GATE and doc_prob < SCENE_STREET_GATE:
+                    scene_kind = "street"
 
                 if street_prob > doc_prob:
                     skip_ocr = True
@@ -1722,16 +1781,31 @@ def analyze_image_entities(
                     if bx[2] - bx[0] < 2 or bx[3] - bx[1] < 2:
                         continue
                         
-                    if use_imajev and score < 0.60:
+                    if use_imajev:
+                        # Every face is evaluated so the terminal reflects the real
+                        # decision for each one (previously only low-confidence
+                        # faces were logged, which left the passport photo with
+                        # no FACE entry at all).
                         crop = image[bx[1]:bx[3], bx[0]:bx[2]]
                         if crop.size > 0:
-                            result = _validate_crop_with_imajev(crop, "face", initial_score=score)
+                            result = _validate_crop_with_imajev(
+                                crop, "face", initial_score=score, scene=scene_kind,
+                            )
                             result["entity"] = "face"
-                            if result["action"] == "approved":
+                            if result["action"] == "rejected" and score < FACE_IMAJEV_DROP_SCORE:
+                                imajev_logs.append(json.dumps(result))
+                                continue
+                            if result["action"] == "rejected":
+                                # A high-confidence first-stage face is never dropped
+                                # on a secondary rejection alone (fail open on privacy).
+                                result["kept"] = True
+                                result["message"] = (
+                                    "⚠️ Imajev: مدل بصری این کادر را رد کرد اما به دلیل اطمینان "
+                                    "بالای تشخیص چهره، کادر برای ماسک‌گذاری حفظ شد."
+                                )
+                            if result["action"] in ("approved", "rejected"):
                                 result["id"] = len(detections) + 1
                             imajev_logs.append(json.dumps(result))
-                            if result["action"] == "rejected":
-                                continue
 
                     detections.append({
                         "type": "face",
@@ -1747,8 +1821,14 @@ def analyze_image_entities(
         plate_model = _model_manager.plate_model
         if plate_model is not None:
             plate_conf = max(conf_threshold, PLATE_MIN_CONFIDENCE)
+            if use_imajev and scene_kind == "document":
+                # A flat scanned document cannot carry a vehicle plate; raising
+                # the floor keeps the detector's 0.6-0.8 document-text false
+                # positives away from the verifier entirely.
+                plate_conf = max(plate_conf, PLATE_DOCUMENT_SCENE_MIN_CONFIDENCE)
             longest_dim = max(width, height)
             yolo_imgsz = 1280 if longest_dim >= 600 else 640
+            suppressed_plate_candidates = 0
             for r in plate_model.predict(source=image, conf=plate_conf, imgsz=yolo_imgsz, iou=0.45, verbose=False):
                 for box in r.boxes:
                     score = float(box.conf[0].item())
@@ -1769,31 +1849,51 @@ def analyze_image_entities(
                     crop = image[bx[1]:bx[3], bx[0]:bx[2]]
                     if crop.size == 0:
                         continue
+
+                    # ---- One candidate, one combined decision, at most one log --- #
+                    # The visual (Imajev) and the textual (OCR) checks are combined
+                    # BEFORE anything reaches imajev_logs, so a candidate can never
+                    # receive both an [APPROVED] and a [REJECTED] entry ("the model
+                    # approved it, then the OCR check rejected it").
+                    vlm_result = None
                     if use_imajev:
-                        result = _validate_crop_with_imajev(crop, "plate", initial_score=score)
-                        result["entity"] = "plate"
-                        imajev_logs.append(json.dumps(result))
-                        if result["action"] == "rejected":
+                        vlm_result = _validate_crop_with_imajev(
+                            crop, "plate", initial_score=score, scene=scene_kind,
+                        )
+                        vlm_result["entity"] = "plate"
+                        if vlm_result["action"] == "rejected":
+                            if scene_kind == "document":
+                                suppressed_plate_candidates += 1
+                            else:
+                                imajev_logs.append(json.dumps(vlm_result))
                             continue
 
-                    # OCR confirmation: on a document the crop must actually read like
-                    # a plate; on a photograph the lenient test applies and an
+                    # OCR confirmation: on a document the crop must actually read
+                    # like a plate; on a photograph the lenient test applies and an
                     # unreadable crop is kept. When no OCR engine could be
                     # initialized the candidate is kept (fail open).
+                    ocr_verified = None
                     ocr_reader = _model_manager.ocr_reader
                     if ocr_reader is not None:
                         plate_text = _read_plate_text(ocr_reader, crop)
-                        verified = (_plate_text_looks_like_plate(plate_text) if document_like
-                                    else _plate_text_is_valid(plate_text))
-                        if not verified:
-                            if use_imajev:
-                                imajev_logs.append(json.dumps({
-                                    "entity": "plate",
-                                    "action": "rejected",
-                                    "reason": "invalid OCR pattern",
-                                    "message": "❌ Imajev/OCR: محتوای کادر با الگوی پلاک همخوانی نداشت و حذف شد",
-                                }))
-                            continue
+                        strict = document_like or scene_kind == "document"
+                        ocr_verified = (_plate_text_looks_like_plate(plate_text) if strict
+                                        else _plate_text_is_valid(plate_text))
+
+                    if ocr_verified is False:
+                        # The visual check passed but the text check did not: the
+                        # final decision is REJECTED, logged once (or suppressed on
+                        # a high-confidence document scene, see the note below).
+                        if scene_kind == "document":
+                            suppressed_plate_candidates += 1
+                        elif use_imajev:
+                            imajev_logs.append(json.dumps({
+                                "entity": "plate",
+                                "action": "rejected",
+                                "reason": "invalid OCR pattern",
+                                "message": "❌ Imajev/OCR: کادر پلاک در بازبینی متن با الگوی پلاک همخوانی نداشت و حذف شد.",
+                            }))
+                        continue
 
                     detections.append({
                         "type": "plate",
@@ -1801,6 +1901,22 @@ def analyze_image_entities(
                         "polygon": _rect_polygon(*bx),
                         "score": round(score, 2),
                     })
+                    if vlm_result is not None:
+                        # Approved, or a fail-open validator error note: one entry.
+                        imajev_logs.append(json.dumps(vlm_result))
+
+            if use_imajev and scene_kind == "document" and suppressed_plate_candidates:
+                # One concise note instead of a contradictory PLATE log storm on
+                # passports / ID cards.
+                imajev_logs.append(json.dumps({
+                    "entity": "plate",
+                    "action": "info",
+                    "reason": "document scene gating",
+                    "message": (
+                        f"ℹ️ Imajev: {suppressed_plate_candidates} کاندید پلاک با گیت صحنهٔ "
+                        "«سند / کارت شناسایی» و اعتبارسنجی متنی حذف شد."
+                    ),
+                }))
     except Exception as e:
         logger.warning("Plate detection skipped: %s", e)
 
@@ -1887,6 +2003,35 @@ def analyze_image_entities(
                         continue
                     
             detections.append(d)
+
+        # Structured reasoning summary: one entry per sensitive entity class that
+        # survived, so the terminal reflects the identity fields that were really
+        # verified (names, document numbers, dates, MRZ) instead of staying silent
+        # about them. Boilerplate / header text produces no entry.
+        if use_imajev:
+            by_entity: Dict[str, List[Dict[str, Any]]] = {}
+            for det in detections:
+                if det.get("type") == "text":
+                    by_entity.setdefault(str(det.get("entity", "TEXT")), []).append(det)
+            for entity_name, items in sorted(
+                by_entity.items(), key=lambda kv: -max(d.get("score", 0.0) for d in kv[1])
+            ):
+                average = sum(d.get("score", 0.0) for d in items) / len(items)
+                label = pii.entity_label(entity_name)
+                sample = str(items[0].get("text", ""))[:24]
+                imajev_logs.append(json.dumps({
+                    "entity": "text",
+                    "action": "approved",
+                    "reason": "identity field verified",
+                    "field": label,
+                    "confidence": round(average, 3),
+                    "text_preview": entity_name,
+                    "message": (
+                        f"✅ Imajev: {len(items)} مورد «{label}» به‌عنوان فیلد هویتی تأیید شد "
+                        f"(میانگین اطمینان {average * 100:.0f}٪؛ نمونه: «{sample}»)."
+                    ),
+                    "scores": {label: round(average, 3)},
+                }))
     except ValueError:
         raise
     except Exception as e:
@@ -1894,8 +2039,14 @@ def analyze_image_entities(
         # Any other engine failure is tolerated: faces and plates still get returned
         # even when the OCR stage could not run.
 
-    if use_imajev and len(imajev_logs) == 1:
-        imajev_logs.append(json.dumps({"entity": "system", "action": "info", "message": "✨ Imajev: همه عناصر شناسایی‌شده دارای ضریب اطمینان بالا بودند و نیازی به فیلتر ثانویه نبود."}))
+    if use_imajev:
+        # Fallback note only when no candidate produced a decision entry at all.
+        decision_entities = {"face", "plate", "text"}
+        has_decisions = any(
+            json.loads(entry).get("entity") in decision_entities for entry in imajev_logs
+        )
+        if not has_decisions:
+            imajev_logs.append(json.dumps({"entity": "system", "action": "info", "message": "✨ Imajev: همه عناصر شناسایی‌شده دارای ضریب اطمینان بالا بودند و نیازی به فیلتر ثانویه نبود."}))
 
     for i, d in enumerate(detections, start=1):
         d["id"] = i

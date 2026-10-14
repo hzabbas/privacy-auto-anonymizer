@@ -1398,6 +1398,52 @@ class AnonymizerStudio {
         }, 160);
     }
 
+    /**
+     * Splits a leading "emoji Imajev:" / "Imajev/OCR:" prefix off a log message.
+     *
+     * The prefix is pure Latin text; leaving it inside the Persian sentence made
+     * the browser's bidi algorithm treat the whole line as LTR (the trailing
+     * period jumped to the right, parentheses flipped). The prefix is rendered
+     * as its own dir="ltr" badge and the sentence keeps its own direction.
+     */
+    splitLogPrefix(message) {
+        const match = /^\s*([✨✅❌⚠🚀ℹ⚡🔍🛡🔒🌐\uFE0F]*)\s*(Imajev(?:\/OCR)?)\s*[:：]\s*/.exec(message || '');
+        if (!match) {
+            return { badge: '', body: String(message || '') };
+        }
+        return {
+            badge: (match[1] ? match[1] + ' ' : '') + match[2] + ':',
+            body: String(message).slice(match[0].length)
+        };
+    }
+
+    /**
+     * Paragraph direction taken from the first strong directional character:
+     * a Persian sentence gets dir="rtl", a pure-English one keeps dir="ltr".
+     * (dir="auto" on the raw message latched onto the Latin "Imajev:" prefix
+     * and scrambled everything that followed.)
+     */
+    detectTextDirection(value) {
+        for (const char of String(value || '')) {
+            if (/[\u0591-\u07FF\uFB1D-\uFDFD\uFE70-\uFEFC\u0600-\u06FF]/.test(char)) return 'rtl';
+            if (/[A-Za-z]/.test(char)) return 'ltr';
+        }
+        return 'rtl';
+    }
+
+    /**
+     * Escapes a log message and isolates its technical runs with <bdi> so the
+     * bidi algorithm can never re-order them: parenthesised groups such as
+     * "(اطمینان 99.9٪)" and the inline tokens OCR / MRZ / PII / YOLO.
+     */
+    formatLogMessageHtml(message) {
+        let html = this.escapeHtml(message);
+        html = html.replace(/\(([^()]{1,90})\)/g, '<bdi>($1)</bdi>');
+        html = html.replace(/\b(OCR|MRZ|PII|YOLO|VLM|PDF417)\b/g, '<bdi>$1</bdi>');
+        html = html.replace(/(\d+(?:[.,]\d+)?[ \t]*[%٪])/g, '<bdi>$1</bdi>');
+        return html;
+    }
+
     renderImajevLogs(logs) {
         const container = document.getElementById('imajevLogContent');
         const countBadge = document.getElementById('imajevLogCount');
@@ -1497,7 +1543,19 @@ class AnonymizerStudio {
             let messageMarkup = '';
             const message = logData.message || (logData.reason ? ('دلیل تصمیم: ' + logData.reason) : '');
             if (message) {
-                messageMarkup = '<div class="text-[11px] text-zinc-300 leading-relaxed font-sans px-0.5" dir="auto">' + this.escapeHtml(message) + '</div>';
+                // Bidi-safe rendering: the Latin "Imajev:" prefix becomes its own
+                // dir="ltr" badge and the sentence itself gets an explicit
+                // dir="rtl"/"ltr" from its first strong character, so a Persian
+                // sentence can never be re-ordered as if it were LTR
+                // (".فعال است OCR" style corruption).
+                const parts = this.splitLogPrefix(message);
+                const direction = this.detectTextDirection(parts.body);
+                const alignClass = direction === 'rtl' ? 'text-right' : 'text-left';
+                const badgeMarkup = parts.badge
+                    ? '<span dir="ltr" class="inline-flex items-center font-mono text-[10px] font-semibold text-cyan-400/90 select-none align-middle" style="margin-inline-end: 0.375rem;">' + this.escapeHtml(parts.badge) + '</span>'
+                    : '';
+                messageMarkup = '<div class="imajev-log-message text-[11px] text-zinc-300 leading-relaxed font-sans px-0.5 ' + alignClass + '" dir="' + direction + '">' +
+                    badgeMarkup + this.formatLogMessageHtml(parts.body) + '</div>';
             }
 
             let metricsMarkup = '';
@@ -1512,7 +1570,7 @@ class AnonymizerStudio {
                     const chips = Object.entries(logData.scores).map(([optionName, optionScore]) => {
                         const percent = Math.round(parseFloat(optionScore) * 100);
                         return '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950/80 border border-zinc-800/80 text-[9px] text-zinc-400">' +
-                            '<span class="text-zinc-300 truncate max-w-[130px]">' + this.escapeHtml(optionName) + ':</span>' +
+                            '<span class="text-zinc-300 truncate max-w-[170px]">' + this.escapeHtml(optionName) + ':</span>' +
                             '<span class="text-cyan-400 font-mono font-semibold">' + percent + '%</span></span>';
                     }).join('');
                     if (chips) {
