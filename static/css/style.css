@@ -229,3 +229,32 @@ body {
 #imajevLogContent {
     min-height: 0;
 }
+
+/* --- Manual redaction regions (human-in-the-loop drawing) ----------------- */
+/* The canvas shows a crosshair whenever a drag there starts a custom region. */
+#editor-canvas.draw-ready {
+    cursor: crosshair;
+}
+
+/* The little × that removes a manually drawn region from its HUD badge. */
+.hud-remove-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 6px;
+    border: 1px solid rgba(244, 63, 94, 0.55);
+    background: rgba(76, 5, 25, 0.85);
+    color: #fda4af;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+    flex-shrink: 0;
+    transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.hud-remove-btn:hover {
+    background: #e11d48;
+    border-color: #fb7185;
+    color: #ffffff;
+}

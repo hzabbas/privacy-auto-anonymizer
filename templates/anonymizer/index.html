@@ -64,12 +64,17 @@
             <!-- Upload Action Button & Settings -->
             <div class="flex flex-wrap items-center gap-3">
                 <!-- Settings Panel: two clearly labelled dropdowns (OCR + layout).
-                     The divider uses logical borders (border-s / ms / ps) so it
-                     stays on the correct side in RTL and no longer collides with
-                     the status badge area. -->
-                <div class="flex flex-wrap items-center gap-2 sm:ms-3 sm:border-s border-zinc-800/80 sm:ps-3">
+                     The divider uses the logical *end* border (me / border-e / pe)
+                     so it sits between this panel and the status badge / upload
+                     button to its left in RTL — the previous border-s floated on
+                     the far right of the OCR dropdown, in empty space. -->
+                <div class="flex flex-wrap items-center gap-2 sm:me-1 sm:border-e border-zinc-800/80 sm:pe-3">
                     <div class="relative inline-flex items-center">
-                        <span class="pointer-events-none absolute start-2 top-1/2 -translate-y-1/2 text-[10px] font-mono font-semibold text-cyan-400/90 select-none" aria-hidden="true">OCR:</span>
+                        <!-- dir="ltr": the badge text is pure Latin; inheriting the
+                             page RTL made it render as ":OCR". The physical right-2
+                             keeps it over the select's start padding, because the
+                             element's own logical start flips with its direction. -->
+                        <span dir="ltr" class="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono font-semibold text-cyan-400/90 select-none" aria-hidden="true">OCR:</span>
                         <select id="ocrEngineSelect" title="موتور بازشناسی متن (OCR)" aria-label="موتور بازشناسی متن (OCR)"
                                 class="bg-zinc-900/50 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-lg ps-11 pe-7 py-1.5 focus:outline-none focus:border-cyan-500/50 transition-colors cursor-pointer appearance-none text-start">
                             <option value="easyocr">EasyOCR (پیش‌فرض)</option>
@@ -103,13 +108,16 @@
                         <!-- The knob is a ::after pseudo-element on the checked-peer
                              *sibling*: Tailwind's peer-checked: variant only reaches
                              siblings, never grandchildren — the old nested <span>
-                             therefore never animated. -->
+                             therefore never animated. Track 36x20px, 1px border,
+                             16px knob: left-0.5 puts it 2px from the inner-left edge,
+                             and translate-x-3.5 (14px) puts it 2px from the
+                             inner-right edge when checked — identical symmetry. -->
                         <div dir="ltr" aria-hidden="true"
                              class="relative w-9 h-5 bg-zinc-800/90 rounded-full border border-zinc-700/80 transition-all duration-300
-                                    after:content-[''] after:absolute after:start-0.5 after:top-1/2 after:-translate-y-1/2 after:h-4 after:w-4 after:rounded-full after:bg-zinc-400 after:transition-all after:duration-300
+                                    after:content-[''] after:absolute after:left-0.5 after:top-1/2 after:-translate-y-1/2 after:h-4 after:w-4 after:rounded-full after:bg-zinc-400 after:transition-all after:duration-300
                                     peer-focus-visible:ring-2 peer-focus-visible:ring-cyan-500/40
                                     peer-checked:bg-cyan-950 peer-checked:border-cyan-400/90 peer-checked:shadow-[0_0_10px_rgba(6,182,212,0.4)]
-                                    peer-checked:after:translate-x-4 peer-checked:after:bg-cyan-400 peer-checked:after:shadow-[0_0_6px_rgba(6,182,212,0.8)]"></div>
+                                    peer-checked:after:translate-x-3.5 peer-checked:after:bg-cyan-400 peer-checked:after:shadow-[0_0_6px_rgba(6,182,212,0.8)]"></div>
                     </label>
                 </div>
 
@@ -153,7 +161,7 @@
             </div>
             <div class="flex items-center gap-2 text-[11px] text-zinc-400">
                 <span class="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping"></span>
-                <span>روی هر کادر کلیک کنید تا ماسک فعال یا لغو شود</span>
+                <span>روی کادرها کلیک کنید یا با کشیدن ماوس روی تصویر، ناحیه جدید رسم کنید</span>
             </div>
         </div>
 

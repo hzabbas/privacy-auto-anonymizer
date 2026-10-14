@@ -48,6 +48,12 @@ class AnonymizerStudio {
         this.pendingReanalysis = false;  // re-run requested while a request was active
         this.badgeEls = new Map();       // detection id -> HUD badge element
         this.toastTimeout = null;
+        this.isDrawing = false;          // manual redaction box currently dragged
+        this.drawStart = null;           // drag anchor in native image pixels
+        this.drawCurrent = null;         // live drag corner in native image pixels
+        this.suppressClickToggle = false;// the click after a drag must not toggle
+        this.hudResizePending = false;   // rAF throttle for the ResizeObserver
+        this.resizeObserver = null;
 
         // Entity colour themes
         this.colorConfig = {
@@ -65,6 +71,11 @@ class AnonymizerStudio {
                 stroke: '#f59e0b',      // neon amber
                 fill: 'rgba(245, 158, 11, 0.15)',
                 label: 'متن حساس (Text)'
+            },
+            manual: {
+                stroke: '#f43f5e',      // rose
+                fill: 'rgba(244, 63, 94, 0.15)',
+                label: 'ناحیه دستی (سفارشی)'
             },
             default: {
                 stroke: '#8b5cf6',
@@ -236,16 +247,32 @@ class AnonymizerStudio {
             });
         }
 
-        // Canvas interaction (human-in-the-loop)
+        // Canvas interaction (human-in-the-loop): click toggles a mask, and a
+        // click-and-drag on empty space draws a custom redaction region.
         this.canvas.addEventListener('click', (event) => this.handleCanvasClick(event));
+        this.canvas.addEventListener('mousedown', (event) => this.handleCanvasMouseDown(event));
         this.canvas.addEventListener('mousemove', (event) => this.handleCanvasMouseMove(event));
+        // The drag keeps tracking even when the pointer leaves the canvas.
+        window.addEventListener('mousemove', (event) => this.handleDrawMove(event));
+        window.addEventListener('mouseup', (event) => this.handleDrawEnd(event));
         this.canvas.addEventListener('mouseleave', () => {
+            if (this.isDrawing) return;
             if (this.hoveredDetectionId !== null) {
                 this.hoveredDetectionId = null;
-                this.canvas.style.cursor = 'default';
+                this.canvas.style.cursor = '';
                 this.render();
             }
         });
+
+        // The workspace animates (grid toggle, panel open/close, window resize),
+        // which changes the canvas' CSS size over 300ms. HUD callouts and SVG
+        // connectors are positioned from getBoundingClientRect(), so they are
+        // recomputed during the transition - not only when it ends.
+        if (typeof ResizeObserver !== 'undefined') {
+            this.resizeObserver = new ResizeObserver(() => this.scheduleHudRealign());
+            if (this.canvasContainer) this.resizeObserver.observe(this.canvasContainer);
+            this.resizeObserver.observe(this.canvas);
+        }
 
         // Batch actions
         if (this.btnAutoRedact) {
@@ -334,12 +361,20 @@ class AnonymizerStudio {
         this.isComparing = active;
         if (active) {
             this.hoveredDetectionId = null;
-            this.canvas.style.cursor = 'default';
+            this.canvas.style.cursor = '';
+            this.canvas.classList.remove('draw-ready');
+        } else if (this.originalImage) {
+            this.canvas.classList.add('draw-ready');
         }
         this.render();
     }
 
     handleCanvasClick(event) {
+        if (this.suppressClickToggle) {
+            // The mouseup that ended a drag gesture must not also toggle a box.
+            this.suppressClickToggle = false;
+            return;
+        }
         if (!this.originalImage || this.detections.length === 0 || this.isComparing) return;
         const { x, y } = this.getCanvasCoordinates(event);
         const hit = this.findHitDetection(x, y);
@@ -350,7 +385,7 @@ class AnonymizerStudio {
     }
 
     handleCanvasMouseMove(event) {
-        if (!this.originalImage || this.detections.length === 0 || this.isComparing) return;
+        if (!this.originalImage || this.isComparing || this.isDrawing) return;
         const { x, y } = this.getCanvasCoordinates(event);
         const hit = this.findHitDetection(x, y);
 
@@ -361,12 +396,157 @@ class AnonymizerStudio {
                 this.render();
             }
         } else {
-            this.canvas.style.cursor = 'default';
+            this.canvas.style.cursor = '';   // falls back to the crosshair class
             if (this.hoveredDetectionId !== null) {
                 this.hoveredDetectionId = null;
                 this.render();
             }
         }
+    }
+
+    // ------------------------------------------------------------------ //
+    // Manual redaction regions (click-and-drag on empty canvas space)     //
+    // ------------------------------------------------------------------ //
+
+    /** Arms the drawing gesture when the press lands on empty canvas space. */
+    handleCanvasMouseDown(event) {
+        if (!this.originalImage || this.isComparing || event.button !== 0) return;
+        const { x, y } = this.getCanvasCoordinates(event);
+        // A press on an existing polygon stays a click (mask toggle).
+        if (this.findHitDetection(x, y)) return;
+        this.drawStart = this.clampToCanvas(x, y);
+        this.drawCurrent = this.drawStart;
+        this.isDrawing = false;          // true once the pointer really moves
+        this.suppressClickToggle = false;
+    }
+
+    handleDrawMove(event) {
+        if (!this.drawStart || this.isComparing) return;
+        const { x, y } = this.getCanvasCoordinates(event);
+        const current = this.clampToCanvas(x, y);
+        if (!this.isDrawing) {
+            const travel = Math.hypot(current.x - this.drawStart.x, current.y - this.drawStart.y);
+            if (travel < 6) return;      // still a click, not a drag yet
+            this.isDrawing = true;
+            this.canvas.style.cursor = 'crosshair';
+        }
+        this.drawCurrent = current;
+        this.render();
+    }
+
+    handleDrawEnd() {
+        if (!this.drawStart) return;
+        const wasDrawing = this.isDrawing;
+        const rect = wasDrawing ? this.getDrawRect() : null;
+        this.drawStart = null;
+        this.drawCurrent = null;
+        this.isDrawing = false;
+        if (!wasDrawing) return;
+
+        this.suppressClickToggle = true;   // consume the click fired after mouseup
+        this.canvas.style.cursor = '';
+
+        const MANUAL_MIN_SIZE = 12;        // native-image pixels for a usable region
+        const width = rect[2] - rect[0];
+        const height = rect[3] - rect[1];
+        if (width >= MANUAL_MIN_SIZE && height >= MANUAL_MIN_SIZE) {
+            const [x1, y1, x2, y2] = rect;
+            this.detections.push({
+                id: this.nextDetectionId(),
+                type: 'manual',
+                entity: 'CUSTOM',
+                label: 'ناحیه دستی (سفارشی)',
+                score: 1.0,
+                bbox: [x1, y1, x2, y2],
+                polygon: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                // isMasked is the flag the renderer / exporter read; redacted
+                // mirrors it for readers that use that descriptive name.
+                isMasked: true,
+                redacted: true,
+                isManual: true
+            });
+            this.updateStatusSummary();
+            this.showToast('ناحیه دستی اضافه شد؛ برای حذف از × روی برچسب استفاده کنید.');
+        }
+        this.render();
+    }
+
+    /** Live dashed cyan/amber rectangle while a manual region is dragged. */
+    drawSelectionPreview(ctx) {
+        const [x1, y1, x2, y2] = this.getDrawRect();
+        const width = x2 - x1;
+        const height = y2 - y1;
+        if (width <= 0 || height <= 0) return;
+        ctx.save();
+        ctx.setLineDash([8, 6]);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(34, 211, 238, 0.95)';
+        ctx.fillStyle = 'rgba(34, 211, 238, 0.14)';
+        ctx.fillRect(x1, y1, width, height);
+        ctx.strokeRect(x1, y1, width, height);
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(245, 158, 11, 0.9)';
+        ctx.strokeRect(x1 + 2, y1 + 2, Math.max(0, width - 4), Math.max(0, height - 4));
+        ctx.restore();
+    }
+
+    /** Normalised [x1, y1, x2, y2] of the box currently being dragged. */
+    getDrawRect() {
+        const anchor = this.drawStart || { x: 0, y: 0 };
+        const corner = this.drawCurrent || anchor;
+        return [
+            Math.round(Math.min(anchor.x, corner.x)),
+            Math.round(Math.min(anchor.y, corner.y)),
+            Math.round(Math.max(anchor.x, corner.x)),
+            Math.round(Math.max(anchor.y, corner.y))
+        ];
+    }
+
+    clampToCanvas(x, y) {
+        return {
+            x: Math.max(0, Math.min(x, this.canvas.width)),
+            y: Math.max(0, Math.min(y, this.canvas.height))
+        };
+    }
+
+    /** Id for a manual detection: one above the highest current id. */
+    nextDetectionId() {
+        return this.detections.reduce((highest, det) => Math.max(highest, det.id || 0), 0) + 1;
+    }
+
+    /** Removes a manual region (its badge, its hover state and its mask). */
+    removeDetection(detectionId) {
+        const before = this.detections.length;
+        this.detections = this.detections.filter(det => det.id !== detectionId);
+        if (this.detections.length === before) return;
+        const badge = this.badgeEls.get(detectionId);
+        if (badge) {
+            badge.remove();
+            this.badgeEls.delete(detectionId);
+        }
+        if (this.hoveredDetectionId === detectionId) this.hoveredDetectionId = null;
+        this.updateStatusSummary();
+        this.render();
+        this.showToast('ناحیه دستی حذف شد.');
+    }
+
+    /** Drops any in-flight drawing state (new image, comparison mode). */
+    cancelDrawing() {
+        this.isDrawing = false;
+        this.drawStart = null;
+        this.drawCurrent = null;
+        this.suppressClickToggle = false;
+    }
+
+    /** rAF-throttled HUD realign, driven by the ResizeObserver. */
+    scheduleHudRealign() {
+        if (!this.originalImage || this.hudResizePending) return;
+        this.hudResizePending = true;
+        requestAnimationFrame(() => {
+            this.hudResizePending = false;
+            if (this.originalImage && !this.isComparing) this.render();
+        });
     }
 
     // ------------------------------------------------------------------ //
@@ -392,6 +572,7 @@ class AnonymizerStudio {
         this.currentFile = file;
         this.detections = [];
         this.hoveredDetectionId = null;
+        this.cancelDrawing();
         this.clearCalloutLayers();
         this.enableControls(false);
         if (this.legendContainer) {
@@ -420,6 +601,7 @@ class AnonymizerStudio {
             if (this.placeholder) this.placeholder.classList.add('hidden');
             if (this.canvasContainer) this.canvasContainer.classList.remove('hidden');
             this.canvas.classList.remove('hidden');
+            this.canvas.classList.add('draw-ready');   // enables manual region drawing
             if (this.dropzone) {
                 this.dropzone.classList.remove('border-dashed');
                 this.dropzone.classList.add('border-solid');
@@ -505,7 +687,15 @@ class AnonymizerStudio {
             throw new Error(data.message || 'پاسخ نامعتبر از سرور دریافت شد.');
         }
 
+        // Manual regions survive a re-analysis (engine switch, Imajev toggle);
+        // they get fresh ids after the server detections so the two id spaces
+        // can never collide.
+        const manualDetections = this.detections.filter(det => det.isManual);
         this.detections = data.detections.map(det => ({ ...det, isMasked: false }));
+        manualDetections.forEach(det => {
+            det.id = this.nextDetectionId();
+            this.detections.push(det);
+        });
 
         if (useImajev && Array.isArray(data.imajev_logs)) {
             this.renderImajevLogs(data.imajev_logs);
@@ -677,6 +867,9 @@ class AnonymizerStudio {
             }
         });
 
+        // Live dashed cyan/amber rectangle while a manual region is dragged.
+        if (this.isDrawing) this.drawSelectionPreview(ctx);
+
         this.renderHUDCallouts();
     }
 
@@ -714,7 +907,7 @@ class AnonymizerStudio {
 
     /**
      * Client-side redaction filters:
-     *  - text: zero-entropy solid black following the oriented polygon.
+     *  - text / manual: zero-entropy solid black following the oriented polygon.
      *  - face/plate: DP-Pix (mosaic + additive noise, Incremental Anonymization 2025).
      */
     applyClientMask(ctx, det, canvasW, canvasH) {
@@ -730,7 +923,7 @@ class AnonymizerStudio {
 
         const hasPolygon = det.polygon && Array.isArray(det.polygon) && det.polygon.length >= 3;
 
-        if (det.type === 'text') {
+        if (det.type === 'text' || det.type === 'manual') {
             ctx.save();
             try {
                 ctx.fillStyle = '#000000';
@@ -969,6 +1162,9 @@ class AnonymizerStudio {
             label = 'پلاک خودرو';
         } else if (det.type === 'face') {
             label = 'چهره';
+        } else if (det.type === 'manual') {
+            label = 'ناحیه دستی';
+            title = 'ناحیه دستی (سفارشی) — ناحیه‌ای که خودتان رسم کرده‌اید (برای حذف × را بزنید)';
         }
         return { label, title };
     }
@@ -1217,6 +1413,12 @@ class AnonymizerStudio {
             }
             const detection = this.detections.find(item => item.id === detectionId);
             if (!detection) return;
+            // The little × on a manual region removes it instead of toggling.
+            if (event && event.target && event.target.closest &&
+                    event.target.closest('[data-remove-detection]')) {
+                this.removeDetection(detectionId);
+                return;
+            }
             detection.isMasked = !detection.isMasked;
             this.updateStatusSummary();
             this.render();
@@ -1269,15 +1471,18 @@ class AnonymizerStudio {
 
         // Rebuild the inner markup only when its content actually changed; this
         // keeps a hovered badge alive while the canvas/HUD re-renders.
-        const signature = [isMasked, scorePercent, displayLabel, fullTitle].join('|');
+        const signature = [isMasked, scorePercent, displayLabel, fullTitle, det.isManual ? 'manual' : ''].join('|');
         if (el.dataset.signature !== signature) {
             el.dataset.signature = signature;
             const scoreChip = '<span class="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded-md bg-zinc-900/90 text-zinc-300 border border-zinc-700/60 flex-shrink-0">' + scorePercent + '%</span>';
             const labelSpan = '<span class="text-zinc-200 font-medium text-[10px] tracking-tight truncate" title="' + this.escapeHtml(fullTitle) + '">' + this.escapeHtml(displayLabel) + '</span>';
             const dotSpan = '<span class="w-1.5 h-1.5 rounded-full flex-shrink-0 transition-transform duration-200 group-hover:scale-125" style="background-color: ' + strokeColor + '; box-shadow: 0 0 6px ' + strokeColor + ';"></span>';
+            const removeBtn = det.isManual
+                ? '<button type="button" data-remove-detection="1" title="حذف ناحیه دستی" aria-label="حذف ناحیه دستی" class="hud-remove-btn">×</button>'
+                : '';
             el.innerHTML = item.isLeftSide
-                ? scoreChip + '<div class="flex items-center gap-1.5 overflow-hidden">' + labelSpan + dotSpan + '</div>'
-                : '<div class="flex items-center gap-1.5 overflow-hidden">' + dotSpan + labelSpan + '</div>' + scoreChip;
+                ? scoreChip + '<div class="flex items-center gap-1.5 overflow-hidden">' + labelSpan + dotSpan + '</div>' + removeBtn
+                : '<div class="flex items-center gap-1.5 overflow-hidden">' + dotSpan + labelSpan + '</div>' + scoreChip + removeBtn;
         }
 
         el.title = fullTitle;
