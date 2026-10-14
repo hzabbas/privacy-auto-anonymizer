@@ -1005,6 +1005,196 @@ def _dedupe_ocr_boxes(boxes: List[_OCRBox]) -> List[_OCRBox]:
     return kept
 
 
+# --------------------------------------------------------------------------- #
+# Split date-token stitching (bilingual passports)                            #
+# --------------------------------------------------------------------------- #
+
+# Month tokens accepted on either side of the bilingual slash (English and
+# French abbreviations, accent variants included).
+_DATE_MONTH_PREFIXES = (
+    "jan", "feb", "fev", "mar", "apr", "avr", "mai", "may", "jun", "juin",
+    "jul", "juil", "aug", "aou", "sep", "sept", "oct", "nov", "dec", "déc",
+)
+
+# "@@ MON" / "@@ MON/MON" - a day+month prefix with no year attached yet.
+_DAY_MONTH_PREFIX_RE = re.compile(
+    r"(?i)^\s*(?:0?[1-9]|[12]\d|3[01])\s+([A-Za-zÀ-ÖØ-öø-ÿ]{3,9})"
+    r"(?:\s*/\s*([A-Za-zÀ-ÖØ-öø-ÿ]{3,9}))?\s*$"
+)
+
+# A box that may be the year half of a date ("13", "1999", OCR-mangled "I3").
+_SHORT_YEAR_RE = re.compile(r"^\s*[0-9Il|OoSsZzB]{2,4}\s*$")
+
+# OCR digit confusions seen in date years (thin glyphs and round shapes).
+_DATE_YEAR_CHAR_FIXES = {
+    "I": "1", "l": "1", "|": "1", "O": "0", "o": "0",
+    "S": "5", "s": "5", "Z": "2", "z": "2", "B": "8",
+}
+
+# A complete date whose trailing year may contain OCR confusions.
+_TRAILING_DATE_YEAR_RE = re.compile(
+    r"(?i)((?:0?[1-9]|[12]\d|3[01])\s+[A-Za-zÀ-ÖØ-öø-ÿ]{3,9}"
+    r"(?:\s*/\s*[A-Za-zÀ-ÖØ-öø-ÿ]{3,9})?\s+)([0-9Il|OoSsZzB]{2,4})\s*$"
+)
+
+# Field kinds whose value row carries a date.
+_DATE_HEADER_KINDS = ("DOB", "ISSUE", "EXPIRY", "DATE_FIELD")
+
+
+def _looks_like_month_token(token: str) -> bool:
+    lowered = (token or "").strip().lower()
+    return bool(lowered) and any(lowered.startswith(prefix) for prefix in _DATE_MONTH_PREFIXES)
+
+
+def _repair_date_year_chars(value: str) -> str:
+    """Character-for-character year repair ("I3" -> "13", "8S" -> "85")."""
+    return "".join(_DATE_YEAR_CHAR_FIXES.get(ch, ch) for ch in (value or ""))
+
+
+def _repair_date_years(text: str) -> str:
+    """
+    Fixes OCR digit confusions in the year of a *complete* date
+    ("14 JAN /JAN I3" -> "14 JAN /JAN 13"). Applied only when the month token in
+    front of the year makes the context unambiguous; the repair is
+    length-preserving, so character offsets stay valid.
+    """
+    def _replace(match) -> str:
+        months = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,9}", match.group(1))
+        if not months or not all(_looks_like_month_token(month) for month in months):
+            return match.group(0)
+        return match.group(1) + _repair_date_year_chars(match.group(2))
+
+    return _TRAILING_DATE_YEAR_RE.sub(_replace, text)
+
+
+def _repair_date_years_in_box(box: _OCRBox) -> _OCRBox:
+    """Returns ``box`` with its trailing date year repaired (same geometry)."""
+    repaired = _repair_date_years(box.text)
+    if repaired == box.text:
+        return box
+    return _OCRBox(box.pts, repaired, box.conf)
+
+
+def _is_day_month_prefix(text: str) -> bool:
+    """True when the whole token is "@@ MON" or "@@ MON/MON" with no year yet."""
+    match = _DAY_MONTH_PREFIX_RE.match(text or "")
+    if not match:
+        return False
+    months = [month for month in match.groups() if month]
+    return bool(months) and all(_looks_like_month_token(month) for month in months)
+
+
+def _union_boxes(boxes: List[_OCRBox]) -> _OCRBox:
+    """One box with the joined text and the union geometry of ``boxes``."""
+    x1 = min(b.x1 for b in boxes)
+    y1 = min(b.y1 for b in boxes)
+    x2 = max(b.x2 for b in boxes)
+    y2 = max(b.y2 for b in boxes)
+    text = " ".join(b.text.strip() for b in sorted(boxes, key=lambda b: b.x1))
+    conf = min(b.conf for b in boxes)
+    return _OCRBox([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], text, conf)
+
+
+def _stitch_split_date_tokens(boxes: List[_OCRBox]) -> List[_OCRBox]:
+    """
+    Rejoins a day+month box with the year box OCR split off.
+
+    On bilingual passports ("14 JAN /JAN    13") the wide gap before the year -
+    often crossed by a SPECIMEN watermark - makes EasyOCR emit "@@ MON/MON" and
+    "13" as two boxes on the same baseline; evaluated separately neither half
+    matches the DATE recognizers. The pair is stitched when the year box shares
+    the baseline (>= 45% vertical overlap) and sits within 6 line-heights to the
+    right; the merged box carries the union geometry, so the whole date -
+    watermark gap included - is redacted as one DATE span.
+    """
+    ordered = sorted(boxes, key=lambda b: (round(b.cy), b.x1))
+    stitched: List[_OCRBox] = []
+    consumed = set()
+    for index, box in enumerate(ordered):
+        if index in consumed:
+            continue
+        if _is_day_month_prefix(box.text):
+            partner = None
+            for other_index in range(index + 1, len(ordered)):
+                if other_index in consumed:
+                    continue
+                other = ordered[other_index]
+                if not _SHORT_YEAR_RE.match(other.text):
+                    continue
+                if not _repair_date_year_chars(other.text).strip().isdigit():
+                    continue
+                overlap = min(box.y2, other.y2) - max(box.y1, other.y1)
+                if overlap < 0.45 * max(1.0, min(box.h, other.h)):
+                    continue
+                gap = other.x1 - box.x2
+                if gap < -2.0 or gap > 6.0 * max(box.h, other.h):
+                    continue
+                partner = other_index
+                break
+            if partner is not None:
+                consumed.add(partner)
+                year_box = ordered[partner]
+                year_box = _OCRBox(
+                    year_box.pts,
+                    _repair_date_year_chars(year_box.text).strip(),
+                    year_box.conf,
+                )
+                stitched.append(_union_boxes([box, year_box]))
+                continue
+        stitched.append(box)
+    return stitched
+
+
+def _stitch_date_value_rows(lines: List[List[_OCRBox]]) -> List[List[_OCRBox]]:
+    """
+    Collects a whole value row under a date header into one box.
+
+    "Date of birth / Date de naissance" is followed by its value row, which OCR
+    may hand back as several boxes ("14 JAN /JAN" + "13"). When the row above is
+    a birth / issue / expiry / date label, every box on the value baseline -
+    however wide the gaps between them - is collected and, when the joined text
+    is a complete date, merged into one box, so the recognizer sees
+    "14 JAN /JAN 13" and the redaction covers the union of the split tokens
+    (the year often sits past the header's right edge on real passports).
+    """
+    out: List[List[_OCRBox]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        out.append(line)
+        kind = None
+        if line:
+            kind = pii.field_header_kind(" ".join(b.text for b in line))
+        if kind in _DATE_HEADER_KINDS and index + 1 < len(lines):
+            first_value = lines[index + 1]
+            if first_value:
+                base_cy = sum(b.cy for b in first_value) / len(first_value)
+                base_h = max(b.h for b in first_value)
+                row_boxes = list(first_value)
+                consumed_lines = 1
+                probe = index + 2
+                while probe < len(lines):
+                    candidate = lines[probe]
+                    if not candidate:
+                        break
+                    cand_cy = sum(b.cy for b in candidate) / len(candidate)
+                    cand_h = max(b.h for b in candidate)
+                    if abs(cand_cy - base_cy) > 0.5 * max(base_h, cand_h) + 1:
+                        break
+                    row_boxes.extend(candidate)
+                    consumed_lines += 1
+                    probe += 1
+                if len(row_boxes) > 1:
+                    ordered_row = sorted(row_boxes, key=lambda b: b.x1)
+                    joined = " ".join(b.text.strip() for b in ordered_row)
+                    if pii.looks_like_date_value(joined):
+                        out.append([_union_boxes(ordered_row)])
+                        index += 1 + consumed_lines
+                        continue
+        index += 1
+    return out
+
+
 def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> List[Dict[str, Any]]:
     boxes = []
     for bbox, text, conf in ocr_results:
@@ -1017,8 +1207,17 @@ def _ocr_pii_detections(ocr_results, width: int, height: int, M_inv=None) -> Lis
     if not boxes:
         return []
 
+    # OCR year misreads ("I3", "8S") are repaired first (in an unambiguous date
+    # context only), so the duplicate-read dedupe below also collapses the
+    # repaired and the clean reading of the same box.
+    boxes = [_repair_date_years_in_box(b) for b in boxes]
     boxes = _dedupe_ocr_boxes(boxes)
+    # Day+month and year boxes that a wide gap (watermark, police spacing) split
+    # apart are stitched back before lines are built.
+    boxes = _stitch_split_date_tokens(boxes)
     lines = _group_lines(boxes)
+    # A whole value row under a date header is evaluated as a single date.
+    lines = _stitch_date_value_rows(lines)
     parts: List[str] = []
     pos = 0
     for li, line in enumerate(lines):

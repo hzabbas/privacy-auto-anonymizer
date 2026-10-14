@@ -33,8 +33,17 @@ def dp_pix_filter(
     Applies Differential Privacy-inspired Pixelation (DP-Pix) with additive Gaussian noise.
 
     Mathematical Formulation (Incremental Image Anonymization, 2025):
-        I_pixelated = Upsample(Downsample(I, ratio=1/pixel_size), method=INTER_NEAREST)
-        I_anonymized = clip(I_pixelated + N(0, noise_scale^2), 0, 255)
+        I_small     = BlockMean(I, b)                                  # b x b cell averaging
+        I_private   = clip(I_small + N(0, noise_scale^2), 0, 255)      # noise at grid level
+        I_pixelated = Upsample(I_private, method=INTER_NEAREST)        # uniform macro-pixels
+
+    The noise MUST be drawn on the downsampled grid *before* the nearest-neighbour
+    upsample: the block-mean has bounded sensitivity (one changed pixel moves its
+    cell mean by at most 255 / b^2), so one Gaussian draw per cell realises the
+    (epsilon, delta) guarantee of the Gaussian mechanism, and every pixel of a
+    macro-pixel then shares the same noisy colour. Adding per-pixel noise *after*
+    upsampling would rebuild exactly the high-frequency grain that de-blurring /
+    super-resolution reconstruction attacks exploit.
 
     The combined mosaic downsampling breaks high-frequency geometric priors, while the
     additive stochastic perturbation destroys deterministic gradient and diffusion inversion
@@ -60,16 +69,20 @@ def dp_pix_filter(
     down_w = max(1, w // pixel_size)
     down_h = max(1, h // pixel_size)
 
-    # 1. Spatial aggregation (downsample -> upsample with nearest neighbor)
-    small = cv2.resize(image_crop, (down_w, down_h), interpolation=cv2.INTER_NEAREST)
-    pixelated = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+    # 1. Spatial aggregation: each grid cell becomes the *mean* of its b x b block
+    #    (INTER_AREA), i.e. the block average f(D) of the DP-Pix formulation.
+    small = cv2.resize(image_crop, (down_w, down_h), interpolation=cv2.INTER_AREA)
 
-    # 2. Stochastic noise injection to mitigate deep generative de-anonymization
+    # 2. Grid-level noise injection (true DP-Pix): one perturbation per macro-pixel,
+    #    applied to the downsampled grid BEFORE upsampling, so each b x b block ends
+    #    up a single uniform noisy colour instead of per-pixel salt-and-pepper grain.
     if noise_scale > 0:
-        noise = np.random.normal(loc=0.0, scale=noise_scale, size=pixelated.shape)
-        anonymized = np.clip(pixelated.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    else:
-        anonymized = pixelated
+        noise = np.random.normal(loc=0.0, scale=noise_scale, size=small.shape)
+        small = np.clip(small.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    # 3. Mosaic reconstruction: INTER_NEAREST gives every pixel of a cell the
+    #    identical colour of its noisy grid cell.
+    anonymized = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
     return anonymized
 

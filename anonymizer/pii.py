@@ -946,6 +946,24 @@ def _header_line_ranges(text: str) -> List[Tuple[int, int]]:
 
 
 # --------------------------------------------------------------------------- #
+# Public helpers for the OCR pipeline layer (ml_pipeline.py)
+# --------------------------------------------------------------------------- #
+
+def field_header_kind(line: str) -> Optional[str]:
+    """
+    Public wrapper around the header classifier: the field kind of a pure label
+    row ("Surname / Nom / Apellidos" -> "SURNAME", "Date of birth" -> "DOB"),
+    or None when the row is not a label-only row.
+    """
+    return _classify_header_line(line)
+
+
+def looks_like_date_value(text: str) -> bool:
+    """Public wrapper: True when the whole (trimmed) value is one calendar date."""
+    return _looks_like_full_date(text)
+
+
+# --------------------------------------------------------------------------- #
 # Machine Readable Zone (TD1 / TD2 / TD3) detection
 # --------------------------------------------------------------------------- #
 # OCR output against real passport photos is noisy: it inserts spaces between
