@@ -15,6 +15,7 @@ The suite is deliberately model-free: no YOLO / EasyOCR / NER weights are loaded
 or downloaded, so `python manage.py test` stays fast and offline-friendly.
 """
 
+import json
 from io import BytesIO
 from unittest import mock
 
@@ -40,7 +41,13 @@ from .ml_pipeline import (
     _plate_text_looks_like_plate,
     _suppressed_by_plate,
     _validate_crop_with_imajev,
+    analyze_image_entities,
+    FACE_OPTIONS,
     get_engine_status,
+    ImajevClassifier,
+    ModelManager,
+    PLATE_OPTIONS,
+    SCENE_OPTIONS,
 )
 
 NL = chr(10)  # keeps multi-line sample documents readable without escapes
@@ -1066,3 +1073,285 @@ class ImageSizeGuardTests(SimpleTestCase):
         with mock.patch("anonymizer.ml_pipeline.MAX_IMAGE_PIXELS", 100):
             with self.assertRaises(ValueError):
                 analyze_image_entities(image)
+
+
+# --------------------------------------------------------------------------- #
+# Bilingual passport dates (pii.py)                                           #
+# --------------------------------------------------------------------------- #
+
+class BilingualPassportDateTests(SimpleTestCase):
+    """Canadian style "DD MON /MON YY" dates must read as DATE (raised to
+    DATE_OF_BIRTH when they sit under a birth label)."""
+
+    SAMPLES = ("01 JAN /JAN 85", "14 JAN /JAN 13", "14 JAN /JAN 23", "05 FEV /FEB 24")
+
+    # OCR routinely reads the thin slash as I / l / 1 / | ("14 JAN IJAN 23").
+    MISREAD_SAMPLES = ("14 JAN IJAN 23", "14 JAN lJAN 13", "14 JAN |JAN 23")
+
+    def test_each_bilingual_shape_is_detected(self):
+        for sample in self.SAMPLES:
+            spans = {(s.entity, sample[s.start:s.end]) for s in pii.find_pii(sample)}
+            self.assertIn(("DATE", sample), spans, sample)
+
+    def test_slash_misread_as_i_l_pipe_is_still_a_date(self):
+        for sample in self.MISREAD_SAMPLES:
+            spans = {(s.entity, sample[s.start:s.end]) for s in pii.find_pii(sample)}
+            self.assertIn(("DATE", sample), spans, sample)
+
+    def test_bilingual_value_under_a_birth_label_is_a_dob(self):
+        text = NL.join(["Date of Birth / Date de naissance", "14 JAN /JAN 13"])
+        spans = {(s.entity, text[s.start:s.end]) for s in pii.find_pii(text)}
+        self.assertIn(("DATE_OF_BIRTH", "14 JAN /JAN 13"), spans)
+
+    def test_bilingual_value_under_an_issue_header_is_a_date(self):
+        text = NL.join(["Date de délivrance / Date of issue", "01 JAN /JAN 85"])
+        spans = {(s.entity, text[s.start:s.end]) for s in pii.find_pii(text)}
+        self.assertIn(("DATE", "01 JAN /JAN 85"), spans)
+
+    def test_fecha_de_nacimiento_header_pairs_its_value(self):
+        text = NL.join(["Fecha de nacimiento", "07 Aug 1999"])
+        spans = {(s.entity, text[s.start:s.end]) for s in pii.find_pii(text)}
+        self.assertIn(("DATE_OF_BIRTH", "07 Aug 1999"), spans)
+
+    def test_non_month_words_never_match_the_bilingual_shape(self):
+        entities = {s.entity for s in pii.find_pii("10 USD /EUR 20")}
+        self.assertNotIn("DATE", entities)
+
+
+# --------------------------------------------------------------------------- #
+# Imajev scene prior (ml_pipeline.py)                                         #
+# --------------------------------------------------------------------------- #
+
+class ImajevScenePriorTests(SimpleTestCase):
+    """Document-scene calibration: plate-shaped *text* must read as printed
+    text (>= 85%), never as a licence plate (< 15%)."""
+
+    @staticmethod
+    def _text_crop():
+        # White crop with letter-like dark blobs: the shape of a "plate
+        # candidate" that in reality is a document text row (passport number).
+        crop = np.full((40, 160, 3), 245, dtype=np.uint8)
+        for index in range(6):
+            x = 12 + index * 24
+            crop[10:30, x:x + 12] = 35
+        return crop
+
+    def _verdict(self, state):
+        with mock.patch.object(ImajevClassifier, "_query_remote_server", return_value=None):
+            return ImajevClassifier().predict_typed(
+                self._text_crop(), options=list(PLATE_OPTIONS), state=state,
+            )
+
+    def test_document_scene_reads_text_not_a_plate(self):
+        scores = self._verdict({"scene": "document"})["scores"]
+        self.assertGreaterEqual(scores["Printed Text"], 0.85)
+        self.assertLessEqual(scores["License Plate"], 0.15)
+
+    def test_without_the_prior_the_shape_alone_still_reads_plate_like(self):
+        scores = self._verdict(None)["scores"]
+        self.assertGreater(scores["License Plate"], 0.5)
+
+
+# --------------------------------------------------------------------------- #
+# Imajev log consistency on identity documents (ml_pipeline.py)               #
+# --------------------------------------------------------------------------- #
+
+class _StubTensorValue:
+    """Mimics the Ultralytics tensor access pattern (box.conf[0].item())."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def item(self):
+        return self._value
+
+    def tolist(self):
+        return self._value
+
+
+class _StubBox:
+    def __init__(self, xyxy, conf):
+        self.conf = [_StubTensorValue(conf)]
+        self.xyxy = [_StubTensorValue(xyxy)]
+
+
+class _StubYoloResult:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+
+class _StubYolo:
+    """Stands in for a YOLO model: returns fixed boxes, ignores kwargs."""
+
+    def __init__(self, boxes):
+        self._boxes = boxes
+
+    def predict(self, **kwargs):
+        return [_StubYoloResult(self._boxes)]
+
+
+class _StubOcrReader:
+    """Answers full-frame / MRZ-band / plate-crop reads by shape."""
+
+    def __init__(self, frame_results, frame_shape,
+                 plate_ok="B 11 HOY", plate_bad="Anthony Caldwell"):
+        self.frame_results = frame_results
+        self.frame_w, self.frame_h = frame_shape
+        self.plate_ok = plate_ok
+        self.plate_bad = plate_bad
+        self.frame_reads = 0
+
+    def readtext(self, image, **kwargs):
+        height, width = image.shape[:2]
+        if width >= self.frame_w * 0.9 and height >= self.frame_h * 0.5:
+            self.frame_reads += 1
+            return list(self.frame_results) if self.frame_reads == 1 else []
+        if width >= self.frame_w * 0.9:
+            return []                                    # bottom MRZ-band read
+        text = self.plate_ok if width >= 220 else self.plate_bad
+        return [([[0, 0], [width, 0], [width, height], [0, height]], text, 0.9)]
+
+
+def _run_imajev_pipeline(frame, face_boxes, plate_boxes, ocr_reader):
+    """analyze_image_entities() with stubbed detectors and the offline Imajev."""
+    face_model = None if face_boxes is None else _StubYolo(face_boxes)
+    plate_model = None if plate_boxes is None else _StubYolo(plate_boxes)
+    face_patch = mock.patch.object(ModelManager, "face_model", new_callable=mock.PropertyMock, return_value=face_model)
+    plate_patch = mock.patch.object(ModelManager, "plate_model", new_callable=mock.PropertyMock, return_value=plate_model)
+    ocr_patch = mock.patch.object(ModelManager, "ocr_reader", new_callable=mock.PropertyMock, return_value=ocr_reader)
+    with mock.patch("anonymizer.ml_pipeline.ENABLE_NER", False), \
+            mock.patch.object(ImajevClassifier, "_query_remote_server", return_value=None), \
+            face_patch, plate_patch, ocr_patch:
+        return analyze_image_entities(frame, use_imajev=True)
+
+
+def _log_entries(result):
+    return [json.loads(entry) for entry in result["imajev_logs"]]
+
+
+def _passport_frame(width=900, height=560):
+    """A synthetic scanned passport page: white paper, text rows, photo, MRZ."""
+    frame = np.full((height, width, 3), 245, dtype=np.uint8)
+    for row_y in (60, 96, 132, 168, 204, 240, 276, 312):
+        for index in range(10):
+            x = 30 + index * 34
+            frame[row_y:row_y + 24, x:x + 18] = 40
+    photo = np.full((140, 120, 3), (120, 140, 180), dtype=np.uint8)
+    photo[:, 12::24] = (170, 190, 225)                   # skin-tone stripes
+    frame[60:200, 700:820] = photo
+    frame[420:452, 20:620] = 50                          # MRZ rows
+    frame[470:502, 20:680] = 50
+    return frame
+
+
+def _street_frame(width=640, height=420):
+    """A synthetic photograph: colourful noise plus two plate-like panels."""
+    rng = np.random.default_rng(11)
+    frame = rng.integers(0, 255, size=(height, width, 3)).astype(np.uint8)
+    for x1, x2 in ((60, 300), (340, 540)):
+        frame[300:350, x1:x2] = 55
+        for index in range((x2 - x1) // 34):
+            x = x1 + 16 + index * 30
+            frame[312:338, x:x + 14] = 235
+    return frame
+
+
+class ImajevLogConsistencyTests(SimpleTestCase):
+    """A passport must never produce the contradictory five-log PLATE storm:
+
+    * no candidate receives both an [APPROVED] and a [REJECTED] entry;
+    * plate false positives on a document scene are suppressed (one note only);
+    * the terminal carries reasoning for the entities that were really found.
+    """
+
+    def _document_inputs(self):
+        frame = _passport_frame()
+        frame_results = [
+            ([[30, 60], [420, 60], [420, 90], [30, 90]], "Surname / Nom / Apellidos", 0.95),
+            ([[30, 96], [260, 96], [260, 126], [30, 126]], "MARTIN", 0.95),
+            ([[30, 132], [420, 132], [420, 162], [30, 162]], "Given Names / Prénoms / Nombres", 0.9),
+            ([[30, 168], [260, 168], [260, 198], [30, 198]], "SARAH", 0.95),
+            ([[30, 204], [430, 204], [430, 234], [30, 234]], "Date of Birth / Date de naissance", 0.9),
+            ([[30, 240], [220, 240], [220, 270], [30, 270]], "14 JAN /JAN 13", 0.9),
+            ([[30, 276], [420, 276], [420, 306], [30, 306]], "Passport No. / No. du Passeport", 0.9),
+            ([[30, 312], [200, 312], [200, 342], [30, 342]], "ZE000509", 0.9),
+            ([[30, 420], [620, 420], [620, 452], [30, 452]],
+             "P<CANMARTIN<<SARAH" + "<" * 25, 0.9),
+            ([[30, 470], [680, 470], [680, 502], [30, 502]],
+             "ZE0005098CAN9401131F2501184" + "<" * 12 + "04", 0.9),
+        ]
+        return frame, _StubOcrReader(frame_results, (frame.shape[1], frame.shape[0]))
+
+    def test_document_scene_suppresses_plate_false_positives(self):
+        frame, reader = self._document_inputs()
+        face_boxes = [_StubBox([700, 60, 820, 200], 0.92)]
+        plate_boxes = [
+            _StubBox([30, 60, 190, 100], 0.85),     # document text -> suppressed
+            _StubBox([30, 420, 220, 460], 0.90),    # MRZ band -> suppressed
+            _StubBox([500, 240, 640, 280], 0.60),   # below the raised document floor
+        ]
+        result = _run_imajev_pipeline(frame, face_boxes, plate_boxes, reader)
+        logs = _log_entries(result)
+
+        plate_entries = [entry for entry in logs if entry.get("entity") == "plate"]
+        # Exactly one aggregate note: never a [APPROVED] + [REJECTED] pair.
+        self.assertEqual([entry["action"] for entry in plate_entries], ["info"])
+        self.assertIn("2", plate_entries[0]["message"])
+        self.assertEqual([d for d in result["detections"] if d["type"] == "plate"], [])
+
+        face_entries = [entry for entry in logs if entry.get("entity") == "face"]
+        self.assertEqual([entry["action"] for entry in face_entries], ["approved"])
+        self.assertTrue(any(d["type"] == "face" for d in result["detections"]))
+
+        scene = next(entry for entry in logs if entry.get("entity") == "scene")
+        self.assertEqual(scene["action"], "approved")
+        self.assertEqual(set(scene["scores"]), set(SCENE_OPTIONS))
+
+    def test_document_reports_reasoning_for_the_detected_identity_fields(self):
+        frame, reader = self._document_inputs()
+        result = _run_imajev_pipeline(frame, None, [], reader)
+        logs = _log_entries(result)
+
+        summaries = [entry for entry in logs if entry.get("entity") == "text"]
+        previews = {entry.get("text_preview") for entry in summaries}
+        self.assertIn("PERSON", previews)
+        self.assertIn("MRZ", previews)
+        self.assertIn("ID_NUMBER", previews)
+        for entry in summaries:
+            self.assertEqual(entry["action"], "approved")
+            self.assertTrue(entry["message"])
+            self.assertTrue(entry["scores"])
+
+        entities = {d.get("entity") for d in result["detections"] if d["type"] == "text"}
+        self.assertIn("PERSON", entities)
+        self.assertIn("MRZ", entities)
+
+
+class ImajevPlateDecisionTests(SimpleTestCase):
+    """One plate candidate -> one combined decision -> at most one log."""
+
+    def test_visual_approval_plus_ocr_rejection_is_a_single_rejected_log(self):
+        frame = _street_frame()
+        reader = _StubOcrReader([], (frame.shape[1], frame.shape[0]))
+        plate_boxes = [
+            _StubBox([60, 300, 300, 350], 0.90),     # reads "B 11 HOY" -> approved
+            _StubBox([340, 300, 540, 350], 0.90),    # reads prose     -> rejected
+        ]
+        result = _run_imajev_pipeline(frame, None, plate_boxes, reader)
+        logs = _log_entries(result)
+
+        plate_entries = [entry for entry in logs if entry.get("entity") == "plate"]
+        # Two candidates, two entries: the second one must NOT also carry the
+        # [APPROVED] entry the old two-pass pipeline appended before its OCR
+        # check rejected it (that alone produced three entries for two boxes).
+        self.assertEqual(sorted(entry["action"] for entry in plate_entries),
+                         ["approved", "rejected"])
+        approved = next(entry for entry in plate_entries if entry["action"] == "approved")
+        self.assertIn("confidence", approved)            # visual verdict carries scores
+        rejected = next(entry for entry in plate_entries if entry["action"] == "rejected")
+        self.assertIn("message", rejected)               # OCR verdict carries its reason
+
+        self.assertEqual(len([d for d in result["detections"] if d["type"] == "plate"]), 1)
+
+        scene = next(entry for entry in logs if entry.get("entity") == "scene")
+        self.assertEqual(scene["action"], "rejected")   # street scene -> OCR skipped

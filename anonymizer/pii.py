@@ -260,7 +260,7 @@ DATE_PATTERN = (
     rf"|\d{{1,2}}(?:st|nd|rd|th)?[ \t]+{_MONTHS}\.?,?[ \t]+\d{{4}}"
     rf"|\d{{1,2}}[ \t\n/.\-A-Z]+{_MONTHS}(?:[ \t\n/.\-A-Z]+{_MONTHS})?[ \t\n/.\-A-Z]+\d{{2,4}})"
 )
-_DOB_LABELS = r"d\.?o\.?b\.?|date[ \t\n]+of[ \t\n]+birth|date[ \t\n]+de[ \t\n]+naissance|geburtstag|birth[ \t\n]*date|birthday|born(?:[ \t\n]+on)?|تولد|تاریخ\s+تولد"
+_DOB_LABELS = r"d\.?o\.?b\.?|date[ \t\n]+of[ \t\n]+birth|date[ \t\n]+de[ \t\n]+naissance|fecha[ \t\n]+de[ \t\n]+nacimiento|geburtstag|birth[ \t\n]*date|birthday|born(?:[ \t\n]+on)?|تولد|تاریخ\s+تولد"
 DOB_RE = re.compile(
     rf"(?i)\b(?:{_DOB_LABELS})\b[A-Za-z \t\n/.\-é:]{{0,30}}({DATE_PATTERN})"
 )
@@ -278,6 +278,24 @@ _DATE_NUMERIC_RE = re.compile(
     r"(?<![\d/.\-])(?:\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4})(?![\d/.\-])"
 )
 
+# Bilingual passport dates: Canadian / international passports print the birth,
+# issue and expiry dates with both the English and French month abbreviations on
+# one line, separated by a slash (often with no space after it), e.g.
+#     "01 JAN /JAN 85"    "14 JAN /JAN 13"    "05 FEV /FEB 24"
+# Only real month words are accepted on either side of the slash, so ordinary
+# "10 USD /EUR 20"-style text can never match.
+_BILINGUAL_MONTH_WORD = (
+    r"(?:janv(?:ier)?|jan(?:uary)?|f[ée]vr(?:ier)?|f[ée]v|feb(?:ruary)?|"
+    r"mars|mar(?:ch)?|avr(?:il)?|apr(?:il)?|mai|may|juin|jun(?:e)?|"
+    r"juil(?:let)?|jul(?:y)?|ao[uû]t?|aug(?:ust)?|"
+    r"sept(?:embre)?|sep(?:t(?:ember)?)?|oct(?:obre|ober)?|"
+    r"nov(?:embre|ember)?|d[ée]c(?:embre|ember)?)"
+)
+_DATE_BILINGUAL_RE = re.compile(
+    rf"(?i)(?<![\w/])(?:0?[1-9]|[12]\d|3[01])[ \t]+{_BILINGUAL_MONTH_WORD}"
+    rf"[ \t]*[/Il|1][ \t]*{_BILINGUAL_MONTH_WORD}[ \t]+(?:\d{{4}}|\d{{2}})(?![\w/])"
+)
+
 # Iranian specific patterns
 IRANIAN_NATIONAL_ID_RE = re.compile(r"(?<![\d\-])(\d{10})(?![\d\-])")
 IRANIAN_PHONE_RE = re.compile(r"(?<![\w+])(?:\+98|0)?9\d{9}(?![\w\-])")
@@ -287,6 +305,7 @@ JALALI_DATE_RE = re.compile(r"\b1[34]\d{2}[/.\-][01]?\d[/.\-][0-3]?\d\b")
 _FULL_DATE_RES = (
     _DATE_DAY_MONTH_YEAR_RE,
     _DATE_MONTH_DAY_YEAR_RE,
+    _DATE_BILINGUAL_RE,
     _DATE_NUMERIC_RE,
     JALALI_DATE_RE,
 )
@@ -462,8 +481,9 @@ def _pattern_spans(text: str) -> List[PIISpan]:
     for m in DOB_RE.finditer(text):
         add(m, "DATE_OF_BIRTH", 0.85, group=1)
 
-    # Standalone calendar dates ("07 Aug 1999", "Aug 07, 1999", numeric forms).
-    for pattern in (_DATE_DAY_MONTH_YEAR_RE, _DATE_MONTH_DAY_YEAR_RE, _DATE_NUMERIC_RE):
+    # Standalone calendar dates ("07 Aug 1999", "Aug 07, 1999", numeric forms and
+    # the bilingual "01 JAN /JAN 85" passport shape).
+    for pattern in (_DATE_DAY_MONTH_YEAR_RE, _DATE_MONTH_DAY_YEAR_RE, _DATE_BILINGUAL_RE, _DATE_NUMERIC_RE):
         for m in pattern.finditer(text):
             add(m, "DATE", 0.75)
 
@@ -670,7 +690,7 @@ _MULTILINGUAL_HEADER_WORDS = {
     "autorite", "autorité", "bill", "billing", "birth", "caducidad", "code",
     "codigo", "código", "currency", "date", "delivrance", "délivrance",
     "department", "endorsements", "expedicion", "expedición", "expiration",
-    "given", "invoice", "issue", "lieu", "lugar", "mentions", "nacimiento",
+    "fecha", "given", "invoice", "issue", "lieu", "lugar", "mentions", "nacimiento",
     "nacionalidad", "naissance", "names", "nationalite", "nationalité",
     "nationality", "nom", "nombres", "page", "pasaporte", "passeport",
     "passport", "place", "prenoms", "prénoms", "receipt", "see", "sex",
@@ -780,7 +800,7 @@ _FIELD_WORD_KINDS = {
     "document": "DOC_NO", "doc": "DOC_NO", "no": "DOC_NO", "number": "DOC_NO",
     "num": "DOC_NO", "شماره": "DOC_NO", "کد": "DOC_NO",
     # dates
-    "date": "DATE_FIELD", "birth": "DOB", "naissance": "DOB",
+    "date": "DATE_FIELD", "fecha": "DATE_FIELD", "birth": "DOB", "naissance": "DOB",
     "nacimiento": "DOB", "تاریخ": "DATE_FIELD", "تولد": "DOB",
     "issue": "ISSUE", "delivrance": "ISSUE", "délivrance": "ISSUE",
     "expedicion": "ISSUE", "expedición": "ISSUE",
