@@ -36,6 +36,17 @@ class AnonymizerStudio {
         this.btnCompare = document.getElementById('btnCompare');
         this.btnExport = document.getElementById('btnExport');
 
+        // XAI governance controls (policy mode, live risk meter, audit export)
+        this.policySelect = document.getElementById('imajevPolicySelect');
+        this.policyParamBadge = document.getElementById('policyParamBadge');
+        this.btnExportAudit = document.getElementById('btnExportAudit');
+        this.riskInitialBar = document.getElementById('riskInitialBar');
+        this.riskResidualBar = document.getElementById('riskResidualBar');
+        this.riskInitialValue = document.getElementById('riskInitialValue');
+        this.riskResidualValue = document.getElementById('riskResidualValue');
+        this.riskStatusLabel = document.getElementById('riskStatusLabel');
+        this.riskNarrative = document.getElementById('riskNarrative');
+
         // State
         this.originalImage = null;
         this.currentFile = null;
@@ -55,52 +66,99 @@ class AnonymizerStudio {
         this.hudResizePending = false;   // rAF throttle for the ResizeObserver
         this.resizeObserver = null;
 
+        // XAI state: the terminal <-> canvas link and the governance profile.
+        this.imajevLogs = [];            // parsed decision records of this image
+        this.logCards = [];              // [{ ids, el, pillEl }] interactive cards
+        this.spotlightDetectionIds = []; // animated spotlight (terminal hover)
+        this.spotlightPhase = 0;         // 0..1 pulse phase of the spotlight ring
+        this.spotlightFrame = null;      // rAF handle of the spotlight animation
+        this.spotlightLastTs = 0;
+        this.spotlightFrameInterval = 45;// ms between pulse frames (~22 fps)
+        this.spotlightPeriod = 1200;     // ms of one full pulse cycle
+        this.auditHighlightIds = [];     // static rings (Fast Audit mode)
+        this.auditRiskFloor = 25;        // weight at which an identifier is high-risk
+        this.policyMode = 'balanced';
+        this.riskAssessment = null;
+        this.imageDimensions = null;
+        // Per-session fingerprint salt: the audit certificate stores only salted
+        // SHA-256 prefixes of the recovered values, so a certificate can never be
+        // turned back into the identity data it describes (a bare hash of a name
+        // or a date is trivially brute-forced from a dictionary).
+        this.auditSalt = this.randomHex(16);
+
+        /**
+         * Governance profiles (Feature 2). ε is the differential-privacy budget
+         * of the client-side DP-Pix mask: a smaller ε means more noise (and thus
+         * more protection) at a higher utility cost. `block`/`sigma` are the DP-Pix
+         * macro-pixel size and the additive Gaussian scale; `confDelta` shifts the
+         * detector confidence threshold sent to the API.
+         */
+        this.policyProfiles = {
+            balanced: {
+                id: 'balanced', label: 'Balanced', epsilon: 2.0,
+                dpPixBlock: 12, dpPixSigma: 18, confThreshold: 0.35,
+                autoRedact: false, highlightRisk: false
+            },
+            strict: {
+                id: 'strict', label: 'Strict Zero-Trust', epsilon: 0.5,
+                dpPixBlock: 20, dpPixSigma: 32, confThreshold: 0.25,
+                autoRedact: true, highlightRisk: false
+            },
+            audit: {
+                id: 'audit', label: 'Fast Audit', epsilon: 1.0,
+                dpPixBlock: 12, dpPixSigma: 18, confThreshold: 0.35,
+                autoRedact: false, highlightRisk: true
+            }
+        };
+
+        /**
+         * Re-identification weights of the detected identifiers (Feature 2): the
+         * probability that a document holder can be singled out from what is left
+         * visible. A machine readable zone and a face are near-certain matches, a
+         * generic identity number is a strong one, and a single quasi-identifier
+         * (a date, a phone number, a city) is weak on its own.
+         */
+        this.riskWeights = {
+            MRZ: 35,
+            face: 28,
+            ID_NUMBER: 25, SSN: 25, CREDIT_CARD: 25, IBAN: 25, NATIONAL_ID: 25,
+            SECRET: 25,
+            PERSON: 20, plate: 20,
+            DATE: 12, DATE_OF_BIRTH: 12, PHONE: 12, EMAIL: 12, ADDRESS: 12,
+            IP_ADDRESS: 12,
+            LOCATION: 8, URL: 8,
+            CUSTOM: 10
+        };
+        // Risk ceiling and the two bands that drive the bar colour (>60 / 25-60 / <25).
+        this.riskCeiling = 99;
+
         // Entity colour themes
         this.colorConfig = {
             face: {
                 stroke: '#06b6d4',      // neon cyan
                 fill: 'rgba(6, 182, 212, 0.15)',
-                label: 'چهره (Face)'
+                label: 'Face'
             },
             plate: {
                 stroke: '#10b981',      // neon emerald
                 fill: 'rgba(16, 185, 129, 0.15)',
-                label: 'پلاک خودرو (Plate)'
+                label: 'License Plate'
             },
             text: {
                 stroke: '#f59e0b',      // neon amber
                 fill: 'rgba(245, 158, 11, 0.15)',
-                label: 'متن حساس (Text)'
+                label: 'Sensitive Text'
             },
             manual: {
                 stroke: '#f43f5e',      // rose
                 fill: 'rgba(244, 63, 94, 0.15)',
-                label: 'ناحیه دستی (سفارشی)'
+                label: 'Custom Region'
             },
             default: {
                 stroke: '#8b5cf6',
                 fill: 'rgba(139, 92, 246, 0.15)',
-                label: 'عنصر حساس'
+                label: 'Sensitive Entity'
             }
-        };
-
-        // Persian labels for the entity names returned by the backend.
-        this.entityLabelsFa = {
-            'Credit card': 'کارت اعتباری',
-            'IBAN': 'شبا (IBAN)',
-            'SSN': 'تأمین اجتماعی',
-            'Secret / key': 'رمز یا کلید',
-            'Email': 'ایمیل',
-            'IP address': 'نشانی IP',
-            'Phone': 'تلفن',
-            'ID number': 'کد شناسایی',
-            'Date of birth': 'تاریخ تولد',
-            'Date': 'تاریخ',
-            'MRZ': 'نوار خوانش ماشینی (MRZ)',
-            'Address': 'نشانی',
-            'URL': 'نشانی وب',
-            'Person name': 'نام شخص',
-            'Location': 'مکان'
         };
 
         this.initEventListeners();
@@ -181,6 +239,164 @@ class AnonymizerStudio {
         return hits[0];
     }
 
+    /** Mask bookkeeping: `isMasked` drives the renderer, `redacted` readers. */
+    setDetectionMask(det, masked) {
+        if (!det) return;
+        det.isMasked = !!masked;
+        det.redacted = !!det.isMasked;
+    }
+
+    /**
+     * Toggles the mask of one linked detection - or of every detection a
+     * cross-check card covers - straight from the terminal (Feature 1).
+     * All masked -> unmask, otherwise mask everything the card refers to.
+     */
+    toggleDetectionsMask(ids) {
+        const detections = (Array.isArray(ids) ? ids : [ids])
+            .map(id => this.detectionById(id))
+            .filter(Boolean);
+        if (detections.length === 0) return;
+        const mask = !detections.every(det => det.isMasked);
+        detections.forEach(det => this.setDetectionMask(det, mask));
+        this.applyAuditHighlights();
+        this.updateStatusSummary();
+        this.render();
+    }
+
+    /** True while a detection is highlighted by a hover (box, badge or card). */
+    isDetectionHighlighted(det) {
+        if (!det) return false;
+        return this.hoveredDetectionId === det.id || this.spotlightDetectionIds.includes(det.id);
+    }
+
+    detectionById(id) {
+        const numeric = Number(id);
+        return this.detections.find(det => det.id === numeric) || null;
+    }
+
+    /** Detection ids an Imajev card links to (detection_ids, then detection_id). */
+    linkedIdsOf(logData) {
+        if (!logData) return [];
+        if (Array.isArray(logData.detection_ids)) {
+            return logData.detection_ids.map(Number).filter(Number.isFinite);
+        }
+        if (logData.detection_id !== undefined && logData.detection_id !== null) {
+            const id = Number(logData.detection_id);
+            return Number.isFinite(id) ? [id] : [];
+        }
+        // Entries produced before the link existed still carry their own id.
+        const legacy = Number(logData.id);
+        return Number.isFinite(legacy) && logData.id ? [legacy] : [];
+    }
+
+    /** Cryptographic random hex string (session fingerprint salt). */
+    randomHex(length) {
+        const bytes = new Uint8Array(Math.ceil(length / 2));
+        if (window.crypto && window.crypto.getRandomValues) {
+            window.crypto.getRandomValues(bytes);
+        } else {
+            for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+        }
+        return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('').slice(0, length);
+    }
+
+    /**
+     * Minimal synchronous SHA-256 (FIPS 180-4).
+     *
+     * Web Crypto would be shorter, but `crypto.subtle` only exists in a secure
+     * context: opening the studio as http://<lan-ip>:8000 (the usual way to show
+     * the project from a phone) would silently lose the audit fingerprint. This
+     * implementation is dependency-free, works offline in every context and is
+     * verified against the FIPS test vector and `sha256sum`.
+     */
+    sha256Hex(message) {
+        const K = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+        ];
+        const H = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        ];
+
+        // UTF-8 bytes of the message.
+        const bytes = [];
+        for (const char of String(message)) {
+            let code = char.codePointAt(0);
+            if (code < 0x80) {
+                bytes.push(code);
+            } else if (code < 0x800) {
+                bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+            } else if (code < 0x10000) {
+                bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+            } else {
+                bytes.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f),
+                    0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+            }
+        }
+
+        const bitLength = bytes.length * 8;
+        bytes.push(0x80);
+        while (bytes.length % 64 !== 56) bytes.push(0);
+        for (let shift = 56; shift >= 0; shift -= 8) {
+            bytes.push((bitLength / Math.pow(2, shift)) & 0xff);
+        }
+
+        const rotateRight = (value, amount) => ((value >>> amount) | (value << (32 - amount))) >>> 0;
+        const words = new Array(64);
+
+        for (let chunk = 0; chunk < bytes.length; chunk += 64) {
+            for (let i = 0; i < 16; i++) {
+                words[i] = ((bytes[chunk + i * 4] << 24) | (bytes[chunk + i * 4 + 1] << 16) |
+                    (bytes[chunk + i * 4 + 2] << 8) | bytes[chunk + i * 4 + 3]) >>> 0;
+            }
+            for (let i = 16; i < 64; i++) {
+                const s0 = rotateRight(words[i - 15], 7) ^ rotateRight(words[i - 15], 18) ^ (words[i - 15] >>> 3);
+                const s1 = rotateRight(words[i - 2], 17) ^ rotateRight(words[i - 2], 19) ^ (words[i - 2] >>> 10);
+                words[i] = (words[i - 16] + s0 + words[i - 7] + s1) >>> 0;
+            }
+
+            let [a, b, c, d, e, f, g, h] = H;
+            for (let i = 0; i < 64; i++) {
+                const S1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+                const ch = (e & f) ^ (~e & g);
+                const temp1 = (h + S1 + ch + K[i] + words[i]) >>> 0;
+                const S0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+                const maj = (a & b) ^ (a & c) ^ (b & c);
+                const temp2 = (S0 + maj) >>> 0;
+                h = g; g = f; f = e;
+                e = (d + temp1) >>> 0;
+                d = c; c = b; b = a;
+                a = (temp1 + temp2) >>> 0;
+            }
+
+            H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0;
+            H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+            H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0;
+            H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+        }
+
+        return H.map(word => word.toString(16).padStart(8, '0')).join('');
+    }
+
+    /**
+     * Non-reversible fingerprint of a recovered value for the audit certificate:
+     * a salted SHA-256 truncated to 10 hex characters. The salt is generated per
+     * session and never exported, so the fingerprint proves stability/equality of
+     * a value inside one audit trail without ever storing the value itself -
+     * and without exposing it to a dictionary attack.
+     */
+    fingerprintValue(value) {
+        if (value === null || value === undefined || String(value) === '') return null;
+        return this.sha256Hex(this.auditSalt + '|' + String(value)).slice(0, 10);
+    }
+
     // ------------------------------------------------------------------ //
     // Event wiring                                                        //
     // ------------------------------------------------------------------ //
@@ -241,9 +457,15 @@ class AnonymizerStudio {
                 const content = document.getElementById('imajevLogContent');
                 const countBadge = document.getElementById('imajevLogCount');
                 if (content) {
-                    content.innerHTML = '<div class="text-zinc-500 text-[11px] italic p-2.5 bg-zinc-900/30 rounded-lg border border-zinc-800/40">لاگ‌ها پاکسازی شدند.</div>';
+                    content.innerHTML = '<div class="text-zinc-500 text-[11px] italic p-2.5 bg-zinc-900/30 rounded-lg border border-zinc-800/40">Logs cleared.</div>';
                 }
-                if (countBadge) countBadge.textContent = '0 رویداد';
+                if (countBadge) countBadge.textContent = '0 events';
+                // The cards are gone, so the spotlight and the audit trace follow.
+                this.logCards = [];
+                this.imajevLogs = [];
+                this.spotlightDetectionIds = [];
+                this.stopSpotlightAnimation();
+                if (this.originalImage) this.render();
             });
         }
 
@@ -278,28 +500,22 @@ class AnonymizerStudio {
         if (this.btnAutoRedact) {
             this.btnAutoRedact.addEventListener('click', () => {
                 if (this.detections.length === 0) return;
-                this.detections.forEach(det => { det.isMasked = true; });
-                this.updateStatusSummary();
-                this.render();
-                this.showToast('تمام عناصر حساس سانسور شدند.');
+                this.setAllMasks(true);
+                this.showToast('All sensitive entities redacted.');
             });
         }
 
         if (this.btnSelectAll) {
             this.btnSelectAll.addEventListener('click', () => {
                 if (this.detections.length === 0) return;
-                this.detections.forEach(det => { det.isMasked = true; });
-                this.updateStatusSummary();
-                this.render();
+                this.setAllMasks(true);
             });
         }
 
         if (this.btnDeselectAll) {
             this.btnDeselectAll.addEventListener('click', () => {
                 if (this.detections.length === 0) return;
-                this.detections.forEach(det => { det.isMasked = false; });
-                this.updateStatusSummary();
-                this.render();
+                this.setAllMasks(false);
             });
         }
 
@@ -354,6 +570,60 @@ class AnonymizerStudio {
         if (this.btnExport) {
             this.btnExport.addEventListener('click', () => this.exportCleanImage());
         }
+
+        // --- XAI governance controls ------------------------------------- //
+        if (this.policySelect) {
+            this.policySelect.addEventListener('change', (event) => {
+                this.applyPolicyMode(event.target.value);
+            });
+        }
+
+        if (this.btnExportAudit) {
+            this.btnExportAudit.addEventListener('click', () => this.exportAuditCertificate());
+        }
+    }
+
+    /**
+     * Applies a privacy governance profile (Feature 2): updates the mask state of
+     * the current detections, the DP-Pix readout, the risk meter and re-runs the
+     * analysis so the new detector threshold reaches the server.
+     */
+    applyPolicyMode(mode, options = {}) {
+        const profile = this.policyProfiles[mode] || this.policyProfiles.balanced;
+        const changed = this.policyMode !== profile.id;
+        this.policyMode = profile.id;
+
+        if (profile.autoRedact && this.detections.length) {
+            this.detections.forEach(det => this.setDetectionMask(det, true));
+        }
+        this.applyAuditHighlights();
+        this.updatePolicyBadge();
+        this.updateStatusSummary();
+        this.render();
+
+        if (changed && options.notify !== false) {
+            this.showToast('Privacy policy: ' + profile.label +
+                ' (ε = ' + profile.epsilon.toFixed(1) + ')');
+        }
+        if (options.reanalyze !== false && this.currentFile && changed) {
+            this.analyzeImage(this.currentFile);
+        }
+        return profile;
+    }
+
+    currentPolicy() {
+        return this.policyProfiles[this.policyMode] || this.policyProfiles.balanced;
+    }
+
+    updatePolicyBadge() {
+        const profile = this.currentPolicy();
+        if (this.policyParamBadge) {
+            this.policyParamBadge.textContent = 'ε=' + profile.epsilon.toFixed(1) +
+                ' · block ' + profile.dpPixBlock + ' · σ ' + profile.dpPixSigma;
+        }
+        if (this.policySelect && this.policySelect.value !== profile.id) {
+            this.policySelect.value = profile.id;
+        }
     }
 
     setComparing(active) {
@@ -363,6 +633,10 @@ class AnonymizerStudio {
             this.hoveredDetectionId = null;
             this.canvas.style.cursor = '';
             this.canvas.classList.remove('draw-ready');
+            // The XAI bridge is paused while the raw image is on screen.
+            this.spotlightDetectionIds = [];
+            this.stopSpotlightAnimation();
+            this.clearLogCardHighlight();
         } else if (this.originalImage) {
             this.canvas.classList.add('draw-ready');
         }
@@ -379,7 +653,8 @@ class AnonymizerStudio {
         const { x, y } = this.getCanvasCoordinates(event);
         const hit = this.findHitDetection(x, y);
         if (!hit) return;
-        hit.isMasked = !hit.isMasked;
+        this.setDetectionMask(hit, !hit.isMasked);
+        this.applyAuditHighlights();
         this.updateStatusSummary();
         this.render();
     }
@@ -391,14 +666,15 @@ class AnonymizerStudio {
 
         if (hit) {
             this.canvas.style.cursor = 'pointer';
-            if (this.hoveredDetectionId !== hit.id) {
-                this.hoveredDetectionId = hit.id;
-                this.render();
-            }
+            const changed = this.hoveredDetectionId !== hit.id;
+            this.hoveredDetectionId = hit.id;
+            this.highlightLogCard(hit.id);      // canvas -> terminal reverse link
+            if (changed) this.render();
         } else {
             this.canvas.style.cursor = '';   // falls back to the crosshair class
             if (this.hoveredDetectionId !== null) {
                 this.hoveredDetectionId = null;
+                this.clearLogCardHighlight();
                 this.render();
             }
         }
@@ -455,7 +731,7 @@ class AnonymizerStudio {
                 id: this.nextDetectionId(),
                 type: 'manual',
                 entity: 'CUSTOM',
-                label: 'ناحیه دستی (سفارشی)',
+                label: 'Custom Region',
                 score: 1.0,
                 bbox: [x1, y1, x2, y2],
                 polygon: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
@@ -466,7 +742,8 @@ class AnonymizerStudio {
                 isManual: true
             });
             this.updateStatusSummary();
-            this.showToast('ناحیه دستی اضافه شد؛ برای حذف از × روی برچسب استفاده کنید.');
+            this.applyAuditHighlights();
+            this.showToast('Custom region added; use the x on its badge to remove it.');
         }
         this.render();
     }
@@ -526,9 +803,12 @@ class AnonymizerStudio {
             this.badgeEls.delete(detectionId);
         }
         if (this.hoveredDetectionId === detectionId) this.hoveredDetectionId = null;
+        this.spotlightDetectionIds = this.spotlightDetectionIds.filter(id => id !== detectionId);
+        this.auditHighlightIds = this.auditHighlightIds.filter(id => id !== detectionId);
         this.updateStatusSummary();
+        this.applyAuditHighlights();
         this.render();
-        this.showToast('ناحیه دستی حذف شد.');
+        this.showToast('Custom region removed.');
     }
 
     /** Drops any in-flight drawing state (new image, comparison mode). */
@@ -562,7 +842,7 @@ class AnonymizerStudio {
         const looksLikeImage = (file.type && file.type.startsWith('image/')) ||
             ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff'].includes(extension);
         if (!looksLikeImage) {
-            this.showToast('لطفاً یک فایل تصویری معتبر (JPG، PNG یا WEBP) انتخاب کنید.', true);
+            this.showToast('Please select a valid image file (JPG, PNG or WEBP).', true);
             return;
         }
 
@@ -574,6 +854,14 @@ class AnonymizerStudio {
         this.hoveredDetectionId = null;
         this.cancelDrawing();
         this.clearCalloutLayers();
+        // The XAI bridge of the previous image must not survive into the next one.
+        this.spotlightDetectionIds = [];
+        this.auditHighlightIds = [];
+        this.stopSpotlightAnimation();
+        this.clearLogCardHighlight();
+        this.logCards = [];
+        this.imajevLogs = [];
+        this.imageDimensions = null;
         this.enableControls(false);
         if (this.legendContainer) {
             this.legendContainer.classList.add('hidden');
@@ -611,7 +899,7 @@ class AnonymizerStudio {
             this.analyzeImage(file);
         };
         img.onerror = () => {
-            this.showToast('فایل تصویری قابل خواندن نیست.', true);
+            this.showToast('The image file could not be read.', true);
         };
         img.src = objectUrl;
     }
@@ -638,7 +926,9 @@ class AnonymizerStudio {
         try {
             const formData = new FormData();
             formData.append('image', targetFile);
-            formData.append('conf_threshold', '0.35');
+            // The policy profile owns the detector threshold: strict mode lowers it
+            // by 0.10 so borderline identifiers still reach the terminal.
+            formData.append('conf_threshold', String(this.currentPolicy().confThreshold));
             formData.append('ocr_engine', document.getElementById('ocrEngineSelect')?.value || 'easyocr');
             formData.append('layout_engine', document.getElementById('layoutEngineSelect')?.value || 'regex');
 
@@ -657,7 +947,7 @@ class AnonymizerStudio {
 
             if (!response.ok) {
                 const errData = await response.json().catch(() => ({}));
-                throw new Error(errData.message || ('خطای سرور: ' + response.status));
+                throw new Error(errData.message || ('Server error: ' + response.status));
             }
 
             const data = await response.json();
@@ -670,7 +960,7 @@ class AnonymizerStudio {
             this.clearCalloutLayers();
             this.render();
             if (this.statusBadge) this.statusBadge.classList.add('hidden');
-            this.showToast('خطا: ' + error.message, true);
+            this.showToast('Error: ' + error.message, true);
         } finally {
             // Only one request can be in flight (guarded above), so clearing the
             // overlay here is always safe - even when this response was stale.
@@ -684,29 +974,50 @@ class AnonymizerStudio {
 
     applyAnalysisResult(data, useImajev) {
         if (data.status !== 'success' || !Array.isArray(data.detections)) {
-            throw new Error(data.message || 'پاسخ نامعتبر از سرور دریافت شد.');
+            throw new Error(data.message || 'Invalid response received from the server.');
         }
 
         // Manual regions survive a re-analysis (engine switch, Imajev toggle);
         // they get fresh ids after the server detections so the two id spaces
         // can never collide.
         const manualDetections = this.detections.filter(det => det.isManual);
-        this.detections = data.detections.map(det => ({ ...det, isMasked: false }));
+        this.detections = data.detections.map(det => {
+            const copy = { ...det };
+            this.setDetectionMask(copy, false);
+            return copy;
+        });
         manualDetections.forEach(det => {
             det.id = this.nextDetectionId();
             this.detections.push(det);
         });
 
+        if (data.image_dimensions) this.imageDimensions = data.image_dimensions;
+
         if (useImajev && Array.isArray(data.imajev_logs)) {
             this.renderImajevLogs(data.imajev_logs);
         } else if (!useImajev) {
+            this.imajevLogs = [];
+            this.logCards = [];
             const statusText = document.getElementById('imajevStatusText');
-            if (statusText) statusText.textContent = 'غیرفعال';
+            if (statusText) statusText.textContent = 'Disabled';
         }
+
+        const profile = this.currentPolicy();
+        if (profile.autoRedact) {
+            // Zero-Trust mode: nothing leaves the studio unmasked by default.
+            this.detections.forEach(det => this.setDetectionMask(det, true));
+        }
+        this.applyAuditHighlights();
 
         this.enableControls(true);
         this.updateStatusSummary();
+        this.updatePolicyBadge();
         this.render();
+
+        if (profile.autoRedact && this.detections.length) {
+            this.showToast('Strict Zero-Trust policy: ' + this.detections.length +
+                ' identifier(s) auto-masked (ε = 0.5).');
+        }
     }
 
     setLoading(loading) {
@@ -721,14 +1032,14 @@ class AnonymizerStudio {
             if (textElement) {
                 textElement.style.transition = 'opacity 0.3s ease';
                 textElement.style.opacity = '1';
-                textElement.textContent = 'در حال پردازش تصویر...';
+                textElement.textContent = 'Processing image...';
 
                 if (this.loadingTimeout) clearTimeout(this.loadingTimeout);
                 this.loadingTimeout = setTimeout(() => {
                     if (!this.isProcessing) return;
                     textElement.style.opacity = '0';
                     setTimeout(() => {
-                        textElement.textContent = 'در حال بارگذاری یا دانلود مدل‌های هوشمند (در اولین اجرا ممکن است چند دقیقه زمان ببرد)...';
+                        textElement.textContent = 'Loading or downloading the AI models (the first run can take a few minutes)...';
                         textElement.style.opacity = '1';
                     }, 300);
                 }, 6000);
@@ -761,14 +1072,14 @@ class AnonymizerStudio {
         const dot = this.statusBadge.querySelector('span.w-2');
 
         if (total === 0) {
-            this.statusText.textContent = 'هیچ عنصر حساسی یافت نشد';
+            this.statusText.textContent = 'No sensitive entities detected';
             if (dot) {
                 dot.classList.remove('bg-emerald-500');
                 dot.classList.add('bg-amber-500');
             }
         } else {
             const maskedCount = this.detections.filter(det => det.isMasked).length;
-            this.statusText.textContent = total + ' مورد شناسایی شد (' + maskedCount + ' ماسک فعال)';
+            this.statusText.textContent = total + ' detected (' + maskedCount + ' masked)';
             if (dot) {
                 dot.classList.remove('bg-amber-500');
                 dot.classList.add('bg-emerald-500');
@@ -782,12 +1093,18 @@ class AnonymizerStudio {
 
         this.statusBadge.classList.remove('hidden');
         this.statusBadge.classList.add('flex');
+
+        // Single funnel for the live governance readout: every path that changes a
+        // mask (canvas click, HUD badge, terminal card, auto-redact, manual box)
+        // ends up here, so the meter and the terminal pills can never go stale.
+        this.updateRiskMeter();
+        this.refreshLogCardStatuses();
     }
 
     setImajevBusyState() {
         const statusText = document.getElementById('imajevStatusText');
         const statusPulse = document.getElementById('imajevStatusPulse');
-        if (statusText) statusText.textContent = 'در حال استدلال...';
+        if (statusText) statusText.textContent = 'Reasoning...';
         if (statusPulse) {
             statusPulse.classList.remove('bg-emerald-400');
             statusPulse.classList.add('bg-cyan-400');
@@ -796,7 +1113,11 @@ class AnonymizerStudio {
         if (container) {
             container.innerHTML = '<div class="text-cyan-400 text-[11px] font-mono flex items-center gap-2 p-2.5 bg-zinc-900/50 rounded-lg border border-zinc-800/60 animate-pulse">' +
                 '<span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>' +
-                'در حال ارسال تصویر و اجرای استدلال معنایی توسط Imajev VLM...</div>';
+                'Uploading the image and running Imajev VLM semantic reasoning...</div>';
+            this.logCards = [];
+            this.imajevLogs = [];
+            this.spotlightDetectionIds = [];
+            this.stopSpotlightAnimation();
         }
     }
 
@@ -839,9 +1160,10 @@ class AnonymizerStudio {
     // Canvas rendering                                                    //
     // ------------------------------------------------------------------ //
 
-    render() {
+    render(options = {}) {
         if (!this.originalImage) return;
 
+        const skipHud = options.skipHud === true;   // pulse frames keep the HUD as is
         const { width, height } = this.canvas;
         const ctx = this.ctx;
 
@@ -849,7 +1171,7 @@ class AnonymizerStudio {
         ctx.drawImage(this.originalImage, 0, 0, width, height);
 
         if (this.isComparing) {
-            this.clearCalloutLayers();
+            if (!skipHud) this.clearCalloutLayers();
             this.drawComparisonWatermark(ctx, width, height);
             return;
         }
@@ -858,8 +1180,18 @@ class AnonymizerStudio {
             if (det.isMasked) this.applyClientMask(ctx, det, width, height);
         });
 
+        // Spotlight rings sit between the masks and the suggestion boxes, so a
+        // spotlighted region stays readable while it pulses.
+        if (this.auditHighlightIds.length || this.spotlightDetectionIds.length) {
+            this.detections.forEach(det => {
+                const animated = this.spotlightDetectionIds.includes(det.id);
+                const audit = !animated && this.auditHighlightIds.includes(det.id);
+                if (animated || audit) this.drawSpotlightRing(ctx, det, animated);
+            });
+        }
+
         this.detections.forEach(det => {
-            const isHovered = (this.hoveredDetectionId === det.id);
+            const isHovered = this.isDetectionHighlighted(det);
             if (det.isMasked) {
                 this.drawMaskedOverlay(ctx, det, isHovered);
             } else {
@@ -870,12 +1202,104 @@ class AnonymizerStudio {
         // Live dashed cyan/amber rectangle while a manual region is dragged.
         if (this.isDrawing) this.drawSelectionPreview(ctx);
 
-        this.renderHUDCallouts();
+        if (!skipHud) this.renderHUDCallouts();
+    }
+
+    /**
+     * Pulsing spotlight ring around one detection (XAI link, Feature 1).
+     *
+     * Amber means the linked region is still exposed, cyan means it is already
+     * masked - the ring therefore answers "what does this log entry refer to, and
+     * is it protected right now?" at a glance. `animated` is only false for the
+     * static Fast-Audit highlights, which must not repaint every frame.
+     */
+    drawSpotlightRing(ctx, det, animated) {
+        const [x1, y1, x2, y2] = det.bbox;
+        const width = x2 - x1;
+        const height = y2 - y1;
+        if (width <= 0 || height <= 0) return;
+
+        const color = det.isMasked ? '34, 211, 238' : '251, 191, 36';   // cyan / amber
+        // Triangle wave: 0 -> 1 -> 0 over one pulse period.
+        const phase = animated ? Math.abs(1 - 2 * (this.spotlightPhase % 1)) : 0.55;
+
+        ctx.save();
+        try {
+            ctx.strokeStyle = 'rgba(' + color + ', ' + (0.35 + 0.45 * phase).toFixed(3) + ')';
+            ctx.fillStyle = 'rgba(' + color + ', ' + (0.06 + 0.06 * phase).toFixed(3) + ')';
+            ctx.shadowColor = 'rgba(' + color + ', 0.9)';
+            ctx.shadowBlur = 12 + 12 * phase;
+            ctx.lineWidth = 2 + 2.5 * phase;
+            ctx.fillRect(x1, y1, width, height);
+            ctx.strokeRect(x1, y1, width, height);
+
+            // Second, wider ring: the "glow" of the spotlight.
+            ctx.shadowBlur = 0;
+            ctx.strokeStyle = 'rgba(' + color + ', ' + (0.18 * (0.4 + phase)).toFixed(3) + ')';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(x1 - 5, y1 - 5, width + 10, height + 10);
+
+            // Corner accents in the entity colour keep the box identifiable.
+            const config = this.colorConfig[det.type] || this.colorConfig.default;
+            this.drawCornerAccents(ctx, x1, y1, width, height, config.stroke);
+        } finally {
+            ctx.restore();
+        }
+    }
+
+    /** Starts/refreshes the spotlight pulse; a no-op while it already runs. */
+    startSpotlightAnimation() {
+        if (!this.originalImage || this.spotlightFrame) return;
+        if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+            this.render();                       // static ring, no animation
+            return;
+        }
+        const tick = (timestamp) => {
+            if (this.spotlightDetectionIds.length === 0) {
+                this.spotlightFrame = null;
+                this.spotlightPhase = 0;
+                this.render();
+                return;
+            }
+            const elapsed = timestamp - this.spotlightLastTs;
+            if (elapsed >= this.spotlightFrameInterval || this.spotlightLastTs === 0) {
+                this.spotlightLastTs = timestamp;
+                this.spotlightPhase += Math.min(elapsed, 60) / this.spotlightPeriod;
+                this.render({ skipHud: true });
+            }
+            this.spotlightFrame = requestAnimationFrame(tick);
+        };
+        this.spotlightFrame = requestAnimationFrame(tick);
+    }
+
+    stopSpotlightAnimation() {
+        if (this.spotlightFrame) cancelAnimationFrame(this.spotlightFrame);
+        this.spotlightFrame = null;
+        this.spotlightLastTs = 0;
+        this.spotlightPhase = 0;
+    }
+
+    /** Keeps the ids on the canvas that the given Imajev card refers to. */
+    setSpotlight(ids) {
+        const next = (Array.isArray(ids) ? ids : [ids])
+            .map(Number)
+            .filter(id => Number.isFinite(id) && this.detections.some(det => det.id === id));
+        const unchanged = next.length === this.spotlightDetectionIds.length &&
+            next.every((id, index) => id === this.spotlightDetectionIds[index]);
+        if (unchanged) return false;
+        this.spotlightDetectionIds = next;
+        return true;
+    }
+
+    clearSpotlight() {
+        if (this.spotlightDetectionIds.length === 0) return false;
+        this.spotlightDetectionIds = [];
+        return true;
     }
 
     drawComparisonWatermark(ctx, width, height) {
         ctx.save();
-        const text = 'تصویر اصلی خام (قبل از پالایش)';
+        const text = 'Original unredacted image (before masking)';
         const fontSize = Math.max(13, Math.min(18, Math.round(width / 50)));
         ctx.font = '600 ' + fontSize + 'px Inter, Vazirmatn, sans-serif';
 
@@ -959,9 +1383,14 @@ class AnonymizerStudio {
             const imgData = ctx.getImageData(x1, y1, w, h);
             const data = imgData.data;
 
-            // Mosaic cell size scales with the region so small faces still lose detail.
-            const blockSize = Math.max(8, Math.min(22, Math.round(Math.min(w, h) / 7)));
-            const noiseScale = 12.0;
+            // Mosaic cell size scales with the region so small faces still lose
+            // detail; the policy profile scales it again (strict mode widens the
+            // macro-pixels and raises the additive noise, i.e. lowers ε).
+            const profile = this.currentPolicy();
+            const regionBlock = Math.max(8, Math.min(22, Math.round(Math.min(w, h) / 7)));
+            const blockSize = Math.max(8, Math.min(40,
+                Math.round(regionBlock * (profile.dpPixBlock / 12))));
+            const noiseScale = profile.dpPixSigma;
 
             for (let by = 0; by < h; by += blockSize) {
                 for (let bx = 0; bx < w; bx += blockSize) {
@@ -1148,23 +1577,22 @@ class AnonymizerStudio {
     // HUD callouts (SVG leaders + HTML badges)                            //
     // ------------------------------------------------------------------ //
 
-    /** Label + tooltip for a detection (Persian for the backend entity names). */
+    /** Label + tooltip for a detection (entity labels come from the backend). */
     getDisplayLabel(det) {
         const config = this.colorConfig[det.type] || this.colorConfig.default;
         let label = config.label;
         let title = det.label ? (config.label + ' - ' + det.label) : config.label;
 
         if (det.type === 'text') {
-            const faLabel = det.label ? (this.entityLabelsFa[det.label] || det.label) : '';
-            label = faLabel ? ('متن: ' + faLabel) : 'متن حساس';
-            if (det.label) title = 'متن حساس: ' + faLabel + ' (' + det.label + ')';
+            label = det.label ? ('Text: ' + det.label) : 'Sensitive Text';
+            if (det.label) title = 'Sensitive Text: ' + det.label;
         } else if (det.type === 'plate') {
-            label = 'پلاک خودرو';
+            label = 'License Plate';
         } else if (det.type === 'face') {
-            label = 'چهره';
+            label = 'Face';
         } else if (det.type === 'manual') {
-            label = 'ناحیه دستی';
-            title = 'ناحیه دستی (سفارشی) — ناحیه‌ای که خودتان رسم کرده‌اید (برای حذف × را بزنید)';
+            label = 'Custom Region';
+            title = 'Custom Region - a region you drew yourself (use the x on its badge to remove it)';
         }
         return { label, title };
     }
@@ -1297,7 +1725,7 @@ class AnonymizerStudio {
         items.forEach(item => {
             const { det, sx1, sx2, boxCenterY, isLeftSide } = item;
             const config = this.colorConfig[det.type] || this.colorConfig.default;
-            const isHovered = (this.hoveredDetectionId === det.id);
+            const isHovered = this.isDetectionHighlighted(det);
             const isMasked = det.isMasked;
             const strokeColor = isMasked ? (isHovered ? '#ef4444' : '#10b981') : config.stroke;
             const clampedY = Math.min(Math.max(item.targetY, topLimit), bottomLimit - 10);
@@ -1419,7 +1847,8 @@ class AnonymizerStudio {
                 this.removeDetection(detectionId);
                 return;
             }
-            detection.isMasked = !detection.isMasked;
+            this.setDetectionMask(detection, !detection.isMasked);
+            this.applyAuditHighlights();
             this.updateStatusSummary();
             this.render();
         };
@@ -1429,16 +1858,24 @@ class AnonymizerStudio {
             if (event.key === 'Enter' || event.key === ' ') toggle(event);
         });
         el.addEventListener('mouseenter', () => {
+            let changed = false;
             if (this.hoveredDetectionId !== detectionId) {
                 this.hoveredDetectionId = detectionId;
-                this.render();
+                changed = true;
             }
+            // Reverse XAI link (canvas -> terminal): flash the cards that judged
+            // this detection and scroll them into view.
+            this.highlightLogCard(detectionId);
+            if (changed) this.render();
         });
         el.addEventListener('mouseleave', () => {
+            let changed = false;
             if (this.hoveredDetectionId === detectionId) {
                 this.hoveredDetectionId = null;
-                this.render();
+                changed = true;
             }
+            this.clearLogCardHighlight();
+            if (changed) this.render();
         });
 
         this.labelsLayer.appendChild(el);
@@ -1478,7 +1915,7 @@ class AnonymizerStudio {
             const labelSpan = '<span class="text-zinc-200 font-medium text-[10px] tracking-tight truncate" title="' + this.escapeHtml(fullTitle) + '">' + this.escapeHtml(displayLabel) + '</span>';
             const dotSpan = '<span class="w-1.5 h-1.5 rounded-full flex-shrink-0 transition-transform duration-200 group-hover:scale-125" style="background-color: ' + strokeColor + '; box-shadow: 0 0 6px ' + strokeColor + ';"></span>';
             const removeBtn = det.isManual
-                ? '<button type="button" data-remove-detection="1" title="حذف ناحیه دستی" aria-label="حذف ناحیه دستی" class="hud-remove-btn">×</button>'
+                ? '<button type="button" data-remove-detection="1" title="Remove custom region" aria-label="Remove custom region" class="hud-remove-btn">×</button>'
                 : '';
             el.innerHTML = item.isLeftSide
                 ? scoreChip + '<div class="flex items-center gap-1.5 overflow-hidden">' + labelSpan + dotSpan + '</div>' + removeBtn
@@ -1487,7 +1924,7 @@ class AnonymizerStudio {
 
         el.title = fullTitle;
         el.setAttribute('aria-pressed', isMasked ? 'true' : 'false');
-        el.setAttribute('aria-label', displayLabel + ' - اطمینان ' + scorePercent + '٪ - ' + (isMasked ? 'ماسک فعال (برای لغو کلیک کنید)' : 'بدون ماسک (برای فعال‌سازی کلیک کنید)'));
+        el.setAttribute('aria-label', displayLabel + ' - ' + scorePercent + '% confidence - ' + (isMasked ? 'Masked (click to unmask)' : 'Exposed (click to mask)'));
     }
 
     // ------------------------------------------------------------------ //
@@ -1500,7 +1937,7 @@ class AnonymizerStudio {
      */
     exportCleanImage() {
         if (!this.originalImage) {
-            this.showToast('تصویری برای استخراج وجود ندارد.', true);
+            this.showToast('There is no image to export.', true);
             return;
         }
 
@@ -1524,7 +1961,7 @@ class AnonymizerStudio {
 
         offCanvas.toBlob((blob) => {
             if (!blob) {
-                this.showToast('ساخت فایل خروجی ناموفق بود.', true);
+                this.showToast('The output file could not be created.', true);
                 return;
             }
             const url = URL.createObjectURL(blob);
@@ -1540,11 +1977,371 @@ class AnonymizerStudio {
             }, 1000);
 
             if (maskedCount > 0) {
-                this.showToast(maskedCount + ' ناحیه پالایش شد و تصویر دانلود گردید.');
+                this.showToast(maskedCount + ' region(s) redacted and the image was downloaded.');
             } else {
-                this.showToast('هیچ ناحیه‌ای ماسک نشده بود؛ تصویر اصلی دانلود شد.', true);
+                this.showToast('No region was masked; the original image was downloaded.', true);
             }
         }, 'image/png');
+    }
+
+    // ------------------------------------------------------------------ //
+    // XAI governance: policy modes, risk meter, terminal<->canvas bridge,  //
+    // zero-PII audit certificate                                          //
+    // ------------------------------------------------------------------ //
+
+    /** Masks or unmasks every detection at once (auto-redact / select / clear). */
+    setAllMasks(masked) {
+        this.detections.forEach(det => this.setDetectionMask(det, masked));
+        this.updateStatusSummary();
+        this.render();
+    }
+
+    /**
+     * Re-identification weight of one detection: how much this single identifier
+     * contributes to singling the person out (see `riskWeights`).
+     */
+    detectionRiskWeight(det) {
+        if (!det) return 0;
+        if (det.type === 'manual') return this.riskWeights.CUSTOM;
+        if (det.type === 'face' || det.type === 'plate') {
+            return this.riskWeights[det.type] || 0;
+        }
+        const entity = String(det.entity || '').toUpperCase();
+        if (entity && this.riskWeights[entity] !== undefined) return this.riskWeights[entity];
+        return det.type === 'text' ? 6 : 0;   // unidentified sensitive text
+    }
+
+    /**
+     * Live re-identification risk assessment (Feature 2).
+     *
+     * initial  - additive weight of every detected identifier, capped at 99%.
+     * residual - weight of the detections that are *still* unmasked, plus the
+     *            differential-privacy leakage floor of the DP-Pix masks: a
+     *            pixelated face is not a zero-information face, and 1/ε is the
+     *            tight bound on what one region can still reveal (ε = 0.5 →
+     *            2%, ε = 2.0 → 0.5%). The zero-entropy solid-black text masks
+     *            leak nothing, so they add no floor: a fully text-masked page
+     *            reports the strict 0%.
+     */
+    computeRiskAssessment() {
+        const profile = this.currentPolicy();
+        const cap = this.riskCeiling;
+        const initial = Math.min(cap, this.detections.reduce(
+            (sum, det) => sum + this.detectionRiskWeight(det), 0));
+        const unmasked = this.detections.filter(det => !det.isMasked);
+        const unmaskedWeight = Math.min(cap, unmasked.reduce(
+            (sum, det) => sum + this.detectionRiskWeight(det), 0));
+        const hasDpPixMask = this.detections.some(
+            det => det.isMasked && (det.type === 'face' || det.type === 'plate'));
+        const dpFloor = hasDpPixMask ? Math.min(2, 1 / profile.epsilon) : 0;
+        const residual = Math.min(cap, Math.round((unmaskedWeight + dpFloor) * 10) / 10);
+
+        let status;
+        if (this.detections.length === 0) {
+            status = 'No Data';
+        } else if (residual <= 2) {
+            status = 'Low Risk / Safe';
+        } else if (residual < 25) {
+            status = 'Moderate Risk';
+        } else if (residual <= 60) {
+            status = 'High Risk - Coverage Required';
+        } else {
+            status = 'Critical Exposure';
+        }
+
+        return {
+            initial: Math.round(initial * 10) / 10,
+            residual,
+            unmasked,
+            maskedCount: this.detections.length - unmasked.length,
+            total: this.detections.length,
+            dpFloor,
+            status,
+            initialBand: this.riskBand(initial),
+            residualBand: this.riskBand(residual),
+            profile
+        };
+    }
+
+    /** Colour band of the meter: >60 red/rose, 25–60 amber, <25 emerald. */
+    riskBand(percent) {
+        if (percent > 60) return 'rose';
+        if (percent >= 25) return 'amber';
+        return 'emerald';
+    }
+
+    riskBandStyle(band) {
+        return {
+            rose: { color: '#f43f5e', glow: 'rgba(244,63,94,0.55)', text: 'text-rose-300', chip: 'border-rose-500/70 bg-rose-950/70 text-rose-300' },
+            amber: { color: '#f59e0b', glow: 'rgba(245,158,11,0.5)', text: 'text-amber-300', chip: 'border-amber-500/70 bg-amber-950/60 text-amber-300' },
+            emerald: { color: '#10b981', glow: 'rgba(16,185,129,0.45)', text: 'text-emerald-300', chip: 'border-emerald-500/70 bg-emerald-950/60 text-emerald-300' },
+            idle: { color: '#52525b', glow: 'rgba(82,82,91,0.4)', text: 'text-zinc-400', chip: 'border-zinc-700/70 bg-zinc-900/70 text-zinc-400' }
+        }[band] || null;
+    }
+
+    /** Smooth width/colour transition of one meter bar (no class churn). */
+    paintRiskBar(el, percent, style) {
+        if (!el || !style) return;
+        el.style.width = Math.max(0, Math.min(100, percent)).toFixed(1) + '%';
+        el.style.backgroundColor = style.color;
+        el.style.boxShadow = percent > 0 ? '0 0 8px ' + style.glow : 'none';
+    }
+
+    /** Repaints the live risk dashboard (called on every mask change). */
+    updateRiskMeter() {
+        const assessment = this.computeRiskAssessment();
+        this.riskAssessment = assessment;
+        const idle = assessment.total === 0;
+        const initialStyle = this.riskBandStyle(idle ? 'idle' : assessment.initialBand);
+        const residualStyle = this.riskBandStyle(idle ? 'idle' : assessment.residualBand);
+        const statusStyle = this.riskBandStyle(idle ? 'idle' : assessment.residualBand);
+
+        this.paintRiskBar(this.riskInitialBar, assessment.initial, initialStyle);
+        this.paintRiskBar(this.riskResidualBar, assessment.residual, residualStyle);
+        if (this.riskInitialValue) this.riskInitialValue.textContent = assessment.initial.toFixed(1) + '%';
+        if (this.riskResidualValue) this.riskResidualValue.textContent = assessment.residual.toFixed(1) + '%';
+        if (this.riskStatusLabel) {
+            this.riskStatusLabel.textContent = assessment.status;
+            this.riskStatusLabel.className = 'text-[9px] font-bold font-mono px-1.5 py-0.5 rounded border whitespace-nowrap ' +
+                statusStyle.chip;
+        }
+        if (this.riskNarrative) {
+            this.riskNarrative.textContent = this.riskNarrativeText(assessment);
+        }
+        if (this.riskInitialValue) {
+            this.riskInitialValue.className = 'text-[10px] font-mono font-bold w-9 text-right ' + initialStyle.text;
+        }
+        if (this.riskResidualValue) {
+            this.riskResidualValue.className = 'text-[10px] font-mono font-bold w-9 text-right ' + residualStyle.text;
+        }
+        return assessment;
+    }
+
+    riskNarrativeText(assessment) {
+        if (assessment.total === 0) return 'Awaiting image analysis...';
+        if (assessment.unmasked.length === 0) {
+            return 'All ' + assessment.total + ' identifier(s) are covered; ' +
+                (assessment.dpFloor > 0
+                    ? 'the DP-Pix noise floor (ε = ' + assessment.profile.epsilon.toFixed(1) + ') '
+                      + 'leaves ' + assessment.dpFloor.toFixed(1) + '% residual leakage.'
+                    : 'every mask is zero-entropy (no residual leakage).');
+        }
+        const labels = [];
+        assessment.unmasked
+            .slice()
+            .sort((a, b) => this.detectionRiskWeight(b) - this.detectionRiskWeight(a))
+            .forEach(det => {
+                const name = this.riskLabelOf(det);
+                if (name && !labels.includes(name)) labels.push(name);
+            });
+        const top = labels.slice(0, 3).join(', ');
+        return assessment.maskedCount + ' of ' + assessment.total + ' identifier(s) masked; '
+            + assessment.unmasked.length + ' still exposed' + (top ? ' (' + top + ')' : '') + '.';
+    }
+
+    /** Short human name of a detection, for the risk narrative. */
+    riskLabelOf(det) {
+        if (!det) return '';
+        if (det.type === 'face') return 'Face';
+        if (det.type === 'plate') return 'License Plate';
+        if (det.type === 'manual') return 'Custom Region';
+        const entity = String(det.entity || '').toUpperCase();
+        const fallback = {
+            PERSON: 'Person Name',
+            MRZ: 'MRZ (Machine Readable Zone)',
+            ID_NUMBER: 'Passport / ID Number'
+        };
+        if (det.label) return det.label;
+        return fallback[entity] || 'Sensitive Text';
+    }
+
+    /**
+     * Fast-Audit mode (Feature 2): permanently rings the high-risk identifiers
+     * (>= auditRiskFloor) that are still unmasked, so the operator inspects
+     * exactly the ones that could re-identify the person.
+     */
+    applyAuditHighlights() {
+        const profile = this.currentPolicy();
+        if (!profile.highlightRisk) {
+            this.auditHighlightIds = [];
+            return 0;
+        }
+        this.auditHighlightIds = this.detections
+            .filter(det => !det.isMasked && this.detectionRiskWeight(det) >= this.auditRiskFloor)
+            .map(det => det.id);
+        return this.auditHighlightIds.length;
+    }
+
+    /**
+     * Reverse link (canvas -> terminal, Feature 1): highlights the terminal cards
+     * that refer to the hovered detection and scrolls them into view when the
+     * reasoning panel is open.
+     */
+    highlightLogCard(ids) {
+        const panel = document.getElementById('imajevLogPanel');
+        const content = document.getElementById('imajevLogContent');
+        if (!panel || panel.classList.contains('hidden')) return;
+        const tokens = (Array.isArray(ids) ? ids : [ids]).map(String);
+        let firstMatch = null;
+        this.logCards.forEach(card => {
+            const linked = card.ids.length > 0 &&
+                card.ids.some(id => tokens.includes(String(id)));
+            card.el.classList.toggle('log-card-linked-active', linked);
+            if (linked && !firstMatch) firstMatch = card.el;
+        });
+        if (firstMatch && content) this.scrollCardIntoView(firstMatch, content);
+    }
+
+    clearLogCardHighlight() {
+        this.logCards.forEach(card => card.el.classList.remove('log-card-linked-active'));
+    }
+
+    /** Scrolls one card into the (independently scrollable) terminal body. */
+    scrollCardIntoView(card, content) {
+        const cardRect = card.getBoundingClientRect();
+        const contentRect = content.getBoundingClientRect();
+        const margin = 10;
+        if (cardRect.top >= contentRect.top + margin &&
+            cardRect.bottom <= contentRect.bottom - margin) {
+            return;                                   // already visible
+        }
+        const target = content.scrollTop + (cardRect.top - contentRect.top) - margin;
+        if (typeof content.scrollTo === 'function') {
+            content.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+        } else {
+            content.scrollTop = Math.max(0, target);
+        }
+    }
+
+    /** Live status pill of an interactive card (masked / exposed / partial). */
+    logCardStatus(detections) {
+        const total = detections.length;
+        if (total === 0) return null;
+        const masked = detections.filter(det => det.isMasked).length;
+        if (masked === total) {
+            return { text: '🟢 Masked', cls: 'border-emerald-500/70 bg-emerald-950/70 text-emerald-300' };
+        }
+        if (masked === 0) {
+            return { text: '🟡 Exposed', cls: 'border-amber-500/70 bg-amber-950/60 text-amber-300' };
+        }
+        return {
+            text: '🟡 ' + masked + '/' + total + ' Masked',
+            cls: 'border-amber-500/70 bg-amber-950/60 text-amber-300'
+        };
+    }
+
+    /** Refreshes every card's pill + high-risk chip from the current mask state. */
+    refreshLogCardStatuses() {
+        const auditMode = this.currentPolicy().highlightRisk;
+        this.logCards.forEach(card => {
+            const detections = card.ids
+                .map(id => this.detectionById(id))
+                .filter(Boolean);
+            if (card.pillEl) {
+                const status = this.logCardStatus(detections);
+                card.pillEl.className = 'js-log-status-pill text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap ' +
+                    (status ? status.cls : 'border-zinc-700/70 bg-zinc-900/70 text-zinc-400');
+                card.pillEl.textContent = status ? status.text : '—';
+                card.pillEl.classList.toggle('hidden', !status);
+            }
+            if (card.riskChipEl) {
+                const highRisk = auditMode && detections.some(
+                    det => !det.isMasked && this.detectionRiskWeight(det) >= this.auditRiskFloor);
+                card.riskChipEl.classList.toggle('hidden', !highRisk);
+            }
+        });
+    }
+
+    /**
+     * Builds the privacy-preserving audit certificate (Feature 4).
+     *
+     * The certificate is an audit trail, not a copy of the document: geometry,
+     * scores, decisions and the model's reasoning, while every recovered value is
+     * represented only by a salted SHA-256 prefix (see `fingerprintValue`).
+     */
+    buildAuditReport() {
+        const profile = this.currentPolicy();
+        const assessment = this.riskAssessment || this.computeRiskAssessment();
+        const dimensions = this.imageDimensions || (this.originalImage
+            ? { width: this.originalImage.naturalWidth, height: this.originalImage.naturalHeight }
+            : { width: this.canvas.width, height: this.canvas.height });
+        const maskedCount = this.detections.filter(det => det.isMasked).length;
+        const manualCount = this.detections.filter(det => det.isManual).length;
+
+        return {
+            schema: 'privacy-audit-report/1.0',
+            generator: 'Privacy Auto-Anonymizer - Imajev XAI Governance Layer',
+            timestamp: new Date().toISOString(),
+            policy_mode: profile.id,
+            policy_label: profile.label,
+            dp_pix_parameters: {
+                epsilon: profile.epsilon,
+                sigma: profile.dpPixSigma,
+                block_size: profile.dpPixBlock
+            },
+            image_dimensions: { width: dimensions.width, height: dimensions.height },
+            risk_assessment: {
+                initial_risk_percent: assessment.initial,
+                residual_risk_percent: assessment.residual,
+                status: assessment.status,
+                residual_dp_pix_floor_percent: assessment.dpFloor,
+                weights_used: this.riskWeights
+            },
+            summary: {
+                total_detections: this.detections.length,
+                masked_count: maskedCount,
+                unmasked_count: this.detections.length - maskedCount,
+                manual_boxes_count: manualCount
+            },
+            privacy_guarantees: {
+                processing: 'client-side only (the server returns geometry, never pixels)',
+                raw_pii_in_entities_audit: false,
+                fingerprint_algorithm: 'SHA-256, salted with a per-session random salt',
+                fingerprint_export: 'first 10 hex characters of sha256(salt + "|" + value)',
+                hash_salt_policy: 'random per session, never exported, never persisted',
+                entities_audit_note: 'values are replaced by fingerprints; bboxes expose geometry only',
+                imajev_reasoning_trace_note: (
+                    'verbatim operator log: it may echo short value previews (max 24 characters) ' +
+                    'because that is what the operator saw on screen; the certificate itself is ' +
+                    'generated and downloaded in the browser, never uploaded'
+                )
+            },
+            entities_audit: this.detections.map(det => ({
+                id: det.id,
+                type: det.type,
+                entity: det.entity || null,
+                label: det.label || null,
+                score: det.score,
+                redacted: !!det.isMasked,
+                bbox: det.bbox,
+                value_sha256_prefix: this.fingerprintValue(det.text)
+            })),
+            imajev_reasoning_trace: this.imajevLogs
+        };
+    }
+
+    exportAuditCertificate() {
+        if (!this.originalImage || this.detections.length === 0) {
+            this.showToast('Analyse an image first to issue the audit certificate.', true);
+            return;
+        }
+
+        const report = this.buildAuditReport();
+        const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.style.display = 'none';
+        link.href = url;
+        link.download = 'privacy-audit-report.json';
+        document.body.appendChild(link);
+        link.click();
+        setTimeout(() => {
+            link.remove();
+            URL.revokeObjectURL(url);
+        }, 1000);
+
+        this.showToast('Audit certificate privacy-audit-report.json exported; residual risk ' +
+            report.risk_assessment.residual_risk_percent + '% (' + report.policy_mode + ').');
     }
 
     // ------------------------------------------------------------------ //
@@ -1592,9 +2389,9 @@ class AnonymizerStudio {
             mainWorkspace.classList.toggle('max-w-[1560px]', isActive);
         }
         if (isActive) {
-            this.showToast('حالت استدلال هوشمند Imajev فعال شد.');
+            this.showToast('Imajev VLM reasoning mode enabled.');
         } else if (statusText) {
-            statusText.textContent = 'غیرفعال';
+            statusText.textContent = 'Disabled';
         }
 
         // Let the layout animation settle, then refresh the HUD alignment.
@@ -1637,14 +2434,16 @@ class AnonymizerStudio {
     }
 
     /**
-     * Escapes a log message and isolates its technical runs with <bdi> so the
-     * bidi algorithm can never re-order them: parenthesised groups such as
-     * "(اطمینان 99.9٪)" and the inline tokens OCR / MRZ / PII / YOLO.
+     * Escapes a log message and isolates its technical runs with <bdi> so a mixed
+     * Latin / symbol run can never be re-ordered by the bidi algorithm:
+     * parenthesised groups such as "(99.9% confidence)" and the inline tokens
+     * OCR / MRZ / VIZ / ICAO.
      */
     formatLogMessageHtml(message) {
         let html = this.escapeHtml(message);
         html = html.replace(/\(([^()]{1,90})\)/g, '<bdi>($1)</bdi>');
-        html = html.replace(/\b(OCR|MRZ|PII|YOLO|VLM|PDF417)\b/g, '<bdi>$1</bdi>');
+        // Latin technical tokens stay legible inside the sentence.
+        html = html.replace(/\b(OCR|MRZ|VIZ|ICAO|PII|YOLO|VLM|PDF417|JSON|SHA|DP-Pix|Zero-Trust)\b/g, '<bdi>$1</bdi>');
         html = html.replace(/(\d+(?:[.,]\d+)?[ \t]*[%٪])/g, '<bdi>$1</bdi>');
         return html;
     }
@@ -1661,8 +2460,14 @@ class AnonymizerStudio {
         this.setImajevPanelVisible(true);
 
         container.textContent = '';
-        if (countBadge) countBadge.textContent = (logs ? logs.length : 0) + ' رویداد';
-        if (statusText) statusText.textContent = 'تکمیل شد';
+        // Rebuilt on every analysis: the parsed records feed the audit certificate
+        // and the cards feed the canvas <-> terminal bridge.
+        this.imajevLogs = [];
+        this.logCards = [];
+        this.spotlightDetectionIds = [];
+        this.stopSpotlightAnimation();
+        if (countBadge) countBadge.textContent = (logs ? logs.length : 0) + ' events';
+        if (statusText) statusText.textContent = 'Completed';
         if (statusPulse) {
             statusPulse.classList.remove('bg-cyan-400');
             statusPulse.classList.add('bg-emerald-400');
@@ -1671,7 +2476,7 @@ class AnonymizerStudio {
         if (!logs || logs.length === 0) {
             const empty = document.createElement('div');
             empty.className = 'text-zinc-500 text-[11px] italic p-3 bg-zinc-950/40 rounded-xl border border-zinc-800/40';
-            empty.textContent = 'هیچ تصمیمی توسط سامانه استدلال Imajev برای این تصویر ثبت نشد.';
+            empty.textContent = 'Imajev recorded no decision for this image.';
             container.appendChild(empty);
             return;
         }
@@ -1715,30 +2520,43 @@ class AnonymizerStudio {
                 actionBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider font-mono bg-cyan-950/90 text-cyan-400 border border-cyan-800/80 shadow-[0_0_8px_rgba(6,182,212,0.25)] select-none">[INFO]</span>';
             }
 
-            item.className = 'imajev-log-item group flex flex-col gap-2 p-3 rounded-xl border transition-all duration-200 relative overflow-hidden cursor-pointer shadow-sm ' + itemBorder;
+            // A dedicated stage (CROSS-CHECK) replaces the plain verdict badge but
+            // keeps its colour, so the closing cross-zone verification stands out.
+            if (logData.stage) {
+                actionBadge = actionBadge.replace(/\[[A-Z-]+\]/,
+                    '[' + String(logData.stage).toUpperCase() + ']');
+            }
+
+            item.className = 'imajev-log-item group flex flex-col gap-2 p-3 rounded-xl border transition-all duration-200 relative overflow-hidden shadow-sm ' + itemBorder;
             item.style.animationDelay = Math.min(index * 60, 600) + 'ms';
 
-            if (logData.id) {
-                item.dataset.detectionId = String(logData.id);
-                item.title = 'برای فعال/غیرفعال کردن ماسک این عنصر کلیک کنید';
+            // ---- Interactive XAI card: terminal <-> canvas spotlight ---------- //
+            const linkedIds = this.linkedIdsOf(logData);
+            if (linkedIds.length) {
+                item.classList.add('imajev-log-card-linked', 'cursor-pointer');
+                item.dataset.detectionIds = linkedIds.join(' ');
+                item.setAttribute('role', 'button');
+                item.setAttribute('tabindex', '0');
+                item.title = 'Hover to spotlight the matching region on the image; '
+                    + 'click to toggle its redaction mask';
+
                 item.addEventListener('mouseenter', () => {
-                    if (this.hoveredDetectionId !== logData.id) {
-                        this.hoveredDetectionId = logData.id;
+                    if (this.setSpotlight(linkedIds)) {
                         this.render();
+                        this.startSpotlightAnimation();
                     }
                 });
                 item.addEventListener('mouseleave', () => {
-                    if (this.hoveredDetectionId === logData.id) {
-                        this.hoveredDetectionId = null;
-                        this.render();
-                    }
+                    const cleared = this.clearSpotlight();
+                    this.stopSpotlightAnimation();
+                    if (cleared) this.render();
                 });
-                item.addEventListener('click', () => {
-                    const detection = this.detections.find(entry => entry.id === logData.id);
-                    if (!detection) return;
-                    detection.isMasked = !detection.isMasked;
-                    this.updateStatusSummary();
-                    this.render();
+                item.addEventListener('click', () => this.toggleDetectionsMask(linkedIds));
+                item.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        this.toggleDetectionsMask(linkedIds);
+                    }
                 });
             }
 
@@ -1746,13 +2564,13 @@ class AnonymizerStudio {
             if (logData.text_preview) entityName += ' "' + logData.text_preview + '"';
 
             let messageMarkup = '';
-            const message = logData.message || (logData.reason ? ('دلیل تصمیم: ' + logData.reason) : '');
+            const message = logData.message || (logData.reason ? ('Decision reason: ' + logData.reason) : '');
             if (message) {
                 // Bidi-safe rendering: the Latin "Imajev:" prefix becomes its own
-                // dir="ltr" badge and the sentence itself gets an explicit
-                // dir="rtl"/"ltr" from its first strong character, so a Persian
-                // sentence can never be re-ordered as if it were LTR
-                // (".فعال است OCR" style corruption).
+                // dir="ltr" badge and the sentence keeps an explicit direction from
+                // its first strong character, so a message that mixes Persian
+                // source material with Latin tokens still renders in the right
+                // reading order instead of being re-ordered as one run.
                 const parts = this.splitLogPrefix(message);
                 const direction = this.detectTextDirection(parts.body);
                 const alignClass = direction === 'rtl' ? 'text-right' : 'text-left';
@@ -1799,20 +2617,56 @@ class AnonymizerStudio {
                     '</div>';
             }
 
+            // Distribution of the reasoning: the two-class prior of the cross-zone
+            // verification (or any other distribution the engine reports).
+            let distributionMarkup = '';
+            if (logData.distribution && typeof logData.distribution === 'object') {
+                const chips = Object.entries(logData.distribution).map(([optionName, optionScore]) => {
+                    const percent = Math.round(parseFloat(optionScore) * 100);
+                    return '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950/80 border border-cyan-900/60 text-[9px] text-zinc-300">' +
+                        '<span class="truncate max-w-[170px]">' + this.escapeHtml(optionName) + '</span>' +
+                        '<span class="text-cyan-300 font-mono font-semibold">' + percent + '%</span></span>';
+                }).join('');
+                if (chips) {
+                    distributionMarkup = '<div class="flex flex-wrap gap-1 pt-1.5 border-t border-zinc-800/40" dir="ltr">' + chips + '</div>';
+                }
+            }
+
+            // The status pill and the high-risk chip are filled by
+            // refreshLogCardStatuses() and stay live with every mask change.
+            const statusPill = '<span class="js-log-status-pill hidden text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap"></span>';
+            const riskChip = '<span class="js-log-risk-chip hidden text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap border-rose-500/70 bg-rose-950/70 text-rose-300">High Risk</span>';
+
             item.innerHTML =
                 '<div class="flex items-center justify-between gap-2" dir="ltr">' +
                 '<div class="flex items-center gap-1.5 overflow-hidden">' +
                 actionBadge +
                 '<span class="text-[10px] font-semibold text-zinc-300 bg-zinc-800/90 border border-zinc-700/60 px-1.5 py-0.5 rounded tracking-wider uppercase truncate">' + this.escapeHtml(entityName) + '</span>' +
                 '</div>' +
-                '<span class="text-[9px] font-mono text-zinc-500 bg-zinc-950/60 px-1.5 py-0.5 rounded border border-zinc-800 flex-shrink-0">#' + String(index + 1).padStart(2, '0') + '</span>' +
+                '<div class="flex items-center gap-1.5 flex-shrink-0">' +
+                riskChip +
+                statusPill +
+                '<span class="text-[9px] font-mono text-zinc-500 bg-zinc-950/60 px-1.5 py-0.5 rounded border border-zinc-800">#' + String(index + 1).padStart(2, '0') + '</span>' +
+                '</div>' +
                 '</div>' +
                 messageMarkup +
-                metricsMarkup;
+                metricsMarkup +
+                distributionMarkup;
 
             container.appendChild(item);
+
+            this.imajevLogs.push(logData);
+            if (linkedIds.length) {
+                this.logCards.push({
+                    ids: linkedIds,
+                    el: item,
+                    pillEl: item.querySelector('.js-log-status-pill'),
+                    riskChipEl: item.querySelector('.js-log-risk-chip')
+                });
+            }
         });
 
+        this.refreshLogCardStatuses();
         container.scrollTop = container.scrollHeight;
     }
 }

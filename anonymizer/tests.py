@@ -25,15 +25,19 @@ from django.urls import reverse
 
 from . import filters, pii
 from .ml_pipeline import (
+    _cross_zone_consistency_entry,
     _dedupe_ocr_boxes,
     _dedupe_text_detections,
     _doctr_pages_to_ocr_results,
     _enhance_contrast,
+    _finalize_detection_links,
     _group_lines,
     _layout_blocks_from_prediction,
     _layout_blocks_with_policy,
     _layout_region_blocks,
     _load_image,
+    _mrz_check_digits_valid,
+    _mrz_field_check_digit,
     _OCRBox,
     _ocr_pii_detections,
     _passport_number_zone_spans,
@@ -42,6 +46,7 @@ from .ml_pipeline import (
     _suppressed_by_plate,
     _validate_crop_with_imajev,
     analyze_image_entities,
+    CROSS_CHECK_VISUAL_ENTITIES,
     FACE_OPTIONS,
     get_engine_status,
     ImajevClassifier,
@@ -184,7 +189,7 @@ class PatternRecognizerTests(SimpleTestCase):
         self.assertEqual(entities, {"EMAIL"})
 
     def test_entity_label_fallback(self):
-        self.assertEqual(pii.entity_label("CREDIT_CARD"), "Credit card")
+        self.assertEqual(pii.entity_label("CREDIT_CARD"), "Credit Card")
         self.assertEqual(pii.entity_label("SOMETHING_NEW"), "Something New")
 
 
@@ -361,7 +366,7 @@ class OcrDetectionMappingTests(SimpleTestCase):
         self.assertTrue(dets)
         det = next(d for d in dets if d["entity"] == "CREDIT_CARD")
         self.assertEqual(det["type"], "text")
-        self.assertEqual(det["label"], "Credit card")
+        self.assertEqual(det["label"], "Credit Card")
         self.assertIn("polygon", det)
         self.assertEqual(len(det["polygon"]), 4)
         for x, y in det["polygon"]:
@@ -590,9 +595,14 @@ class PassportFieldPairingTests(SimpleTestCase):
         self.assertIn(("PERSON", "رضایی"), found)
         self.assertIn(("ID_NUMBER", "D23145890"), found)
 
-    def test_entity_labels_for_new_entities(self):
-        self.assertEqual(pii.entity_label("MRZ"), "MRZ")
+    def test_entity_labels_are_human_readable_english(self):
+        self.assertEqual(pii.entity_label("MRZ"), "MRZ (Machine Readable Zone)")
         self.assertEqual(pii.entity_label("DATE"), "Date")
+        self.assertEqual(pii.entity_label("PERSON"), "Person Name")
+        self.assertEqual(pii.entity_label("ID_NUMBER"), "Passport / ID Number")
+        self.assertEqual(pii.entity_label("CREDIT_CARD"), "Credit Card")
+        self.assertEqual(pii.entity_label("ADDRESS"), "Street Address")
+        self.assertEqual(pii.entity_label("SECRET"), "API Key / Secret")
 
 
 class MrzRobustnessTests(SimpleTestCase):
@@ -1244,6 +1254,30 @@ def _passport_frame(width=900, height=560):
     return frame
 
 
+# The printed (VIZ) rows of the synthetic passport above, one OCR reading each.
+_PASSPORT_OCR_ROWS = [
+    ([[30, 60], [420, 60], [420, 90], [30, 90]], "Surname / Nom / Apellidos", 0.95),
+    ([[30, 96], [260, 96], [260, 126], [30, 126]], "MARTIN", 0.95),
+    ([[30, 132], [420, 132], [420, 162], [30, 162]], "Given Names / Prénoms / Nombres", 0.9),
+    ([[30, 168], [260, 168], [260, 198], [30, 198]], "SARAH", 0.95),
+    ([[30, 204], [430, 204], [430, 234], [30, 234]], "Date of Birth / Date de naissance", 0.9),
+    ([[30, 240], [220, 240], [220, 270], [30, 270]], "14 JAN /JAN 13", 0.9),
+    ([[30, 276], [420, 276], [420, 306], [30, 306]], "Passport No. / No. du Passeport", 0.9),
+    ([[30, 312], [200, 312], [200, 342], [30, 342]], "ZE000509", 0.9),
+    ([[30, 420], [620, 420], [620, 452], [30, 452]],
+     "P<CANMARTIN<<SARAH" + "<" * 25, 0.9),
+    ([[30, 470], [680, 470], [680, 502], [30, 502]],
+     "ZE0005098CAN9401131F2501184" + "<" * 12 + "04", 0.9),
+]
+
+
+def _passport_document_inputs(rows=None):
+    """(frame, OCR reader) for the synthetic passport, VIZ rows + both MRZ lines."""
+    frame = _passport_frame()
+    results = _PASSPORT_OCR_ROWS if rows is None else rows
+    return frame, _StubOcrReader(list(results), (frame.shape[1], frame.shape[0]))
+
+
 def _street_frame(width=640, height=420):
     """A synthetic photograph: colourful noise plus two plate-like panels."""
     rng = np.random.default_rng(11)
@@ -1265,22 +1299,7 @@ class ImajevLogConsistencyTests(SimpleTestCase):
     """
 
     def _document_inputs(self):
-        frame = _passport_frame()
-        frame_results = [
-            ([[30, 60], [420, 60], [420, 90], [30, 90]], "Surname / Nom / Apellidos", 0.95),
-            ([[30, 96], [260, 96], [260, 126], [30, 126]], "MARTIN", 0.95),
-            ([[30, 132], [420, 132], [420, 162], [30, 162]], "Given Names / Prénoms / Nombres", 0.9),
-            ([[30, 168], [260, 168], [260, 198], [30, 198]], "SARAH", 0.95),
-            ([[30, 204], [430, 204], [430, 234], [30, 234]], "Date of Birth / Date de naissance", 0.9),
-            ([[30, 240], [220, 240], [220, 270], [30, 270]], "14 JAN /JAN 13", 0.9),
-            ([[30, 276], [420, 276], [420, 306], [30, 306]], "Passport No. / No. du Passeport", 0.9),
-            ([[30, 312], [200, 312], [200, 342], [30, 342]], "ZE000509", 0.9),
-            ([[30, 420], [620, 420], [620, 452], [30, 452]],
-             "P<CANMARTIN<<SARAH" + "<" * 25, 0.9),
-            ([[30, 470], [680, 470], [680, 502], [30, 502]],
-             "ZE0005098CAN9401131F2501184" + "<" * 12 + "04", 0.9),
-        ]
-        return frame, _StubOcrReader(frame_results, (frame.shape[1], frame.shape[0]))
+        return _passport_document_inputs()
 
     def test_document_scene_suppresses_plate_false_positives(self):
         frame, reader = self._document_inputs()
@@ -1355,6 +1374,309 @@ class ImajevPlateDecisionTests(SimpleTestCase):
 
         scene = next(entry for entry in logs if entry.get("entity") == "scene")
         self.assertEqual(scene["action"], "rejected")   # street scene -> OCR skipped
+
+
+# --------------------------------------------------------------------------- #
+# XAI detection linking (ml_pipeline.py)                                      #
+# --------------------------------------------------------------------------- #
+
+class ImajevDetectionLinkTests(SimpleTestCase):
+    """The bi-directional spotlight reads `detection_id(s)` + `bbox`: every entry
+    that judged a kept detection must point at it, and only at it."""
+
+    def _passport_result(self):
+        frame, reader = _passport_document_inputs()
+        result = _run_imajev_pipeline(frame, [_StubBox([700, 60, 820, 200], 0.92)], [], reader)
+        return result, _log_entries(result)
+
+    def test_linked_entries_target_a_real_detection_with_matching_bbox(self):
+        result, logs = self._passport_result()
+        by_id = {det["id"]: det for det in result["detections"]}
+        linked = [entry for entry in logs if "detection_id" in entry]
+        self.assertTrue(linked, "no entry carries a detection link")
+        self.assertEqual(linked, [entry for entry in logs if entry.get("detection_ids")])
+
+        for entry in linked:
+            self.assertIn(entry["detection_id"], by_id)
+            self.assertIn(entry["detection_id"], entry["detection_ids"])
+            primary = by_id[entry["detection_id"]]
+            self.assertEqual(entry["bbox"], primary["bbox"])
+            self.assertTrue(set(entry["detection_ids"]) <= set(by_id))
+
+    def test_face_entry_links_to_the_face_detection(self):
+        result, logs = self._passport_result()
+        face_logs = [entry for entry in logs if entry.get("entity") == "face"]
+        face_ids = [det["id"] for det in result["detections"] if det["type"] == "face"]
+        self.assertEqual(len(face_logs), 1)
+        self.assertEqual(face_logs[0]["detection_ids"], face_ids)
+
+    def test_entity_summary_links_every_detection_of_its_class(self):
+        result, logs = self._passport_result()
+        person_ids = sorted(det["id"] for det in result["detections"]
+                            if det.get("entity") == "PERSON")
+        self.assertTrue(person_ids)
+        summary = next(entry for entry in logs if entry.get("text_preview") == "PERSON")
+        self.assertEqual(summary["detection_ids"], person_ids)
+
+        mrz_ids = sorted(det["id"] for det in result["detections"] if det.get("entity") == "MRZ")
+        mrz_summary = next(entry for entry in logs if entry.get("text_preview") == "MRZ")
+        self.assertEqual(mrz_summary["detection_ids"], mrz_ids)
+
+    def test_rejected_candidate_is_not_interactive(self):
+        """A candidate the validator dropped is not a detection: no link, because
+        the card must not offer to mask something that is not on the canvas."""
+        frame = _street_frame()
+        reader = _StubOcrReader([], (frame.shape[1], frame.shape[0]))
+        plate_boxes = [
+            _StubBox([60, 300, 300, 350], 0.90),     # reads "B 11 HOY" -> approved
+            _StubBox([340, 300, 540, 350], 0.90),    # reads prose     -> rejected
+        ]
+        result = _run_imajev_pipeline(frame, None, plate_boxes, reader)
+        plate_logs = [entry for entry in _log_entries(result) if entry.get("entity") == "plate"]
+
+        rejected = next(entry for entry in plate_logs if entry["action"] == "rejected")
+        self.assertNotIn("detection_id", rejected)
+        self.assertNotIn("detection_ids", rejected)
+
+        approved = next(entry for entry in plate_logs if entry["action"] == "approved")
+        plate_ids = [det["id"] for det in result["detections"] if det["type"] == "plate"]
+        self.assertEqual(approved["detection_ids"], plate_ids)
+
+    def test_internal_reference_never_reaches_the_response(self):
+        result, _logs = self._passport_result()
+        payload = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("_detection_refs", payload)
+        for entry in _log_entries(result):
+            self.assertNotIn("_detection_refs", entry)
+
+    def test_manual_and_geometry_only_detections_are_never_linked(self):
+        """Without a reference the entry keeps no id (nothing to spotlight)."""
+        entries = [{"entity": "system", "action": "info", "message": "x"}]
+        _finalize_detection_links(entries, [{"id": 1, "type": "face", "bbox": [0, 0, 4, 4]}])
+        self.assertNotIn("detection_id", entries[0])
+        self.assertNotIn("detection_ids", entries[0])
+        self.assertNotIn("bbox", entries[0])
+
+
+# --------------------------------------------------------------------------- #
+# Cross-zone VIZ <-> MRZ verification (ml_pipeline.py)                        #
+# --------------------------------------------------------------------------- #
+
+class IcaoCheckDigitTests(SimpleTestCase):
+    """ICAO Doc 9303 check digits, validated against the specimen data page of
+    Part 4 (Appendix): L898902C36UTO7408122F1204159ZE184226B<<<<<10."""
+
+    TD3_SPECIMEN = "L898902C36UTO7408122F1204159ZE184226B<<<<<10"
+
+    def test_field_check_digit_uses_the_7_3_1_weights(self):
+        self.assertEqual(_mrz_field_check_digit("L898902C3"), "6")
+        self.assertEqual(_mrz_field_check_digit("740812"), "2")
+        self.assertEqual(_mrz_field_check_digit("120415"), "9")
+        self.assertEqual(_mrz_field_check_digit("ZE184226B<<<<<"), "1")
+        self.assertEqual(_mrz_field_check_digit("520727"), "3")     # second specimen DOB
+        self.assertEqual(_mrz_field_check_digit("AB1£"), "")        # never an MRZ char
+
+    def test_specimen_data_page_validates(self):
+        self.assertEqual(len(self.TD3_SPECIMEN), 44)
+        self.assertIs(_mrz_check_digits_valid(self.TD3_SPECIMEN), True)
+
+    def test_tampered_field_is_detected(self):
+        # A forged date of birth (74 -> 75) breaks both the field and composite digit.
+        self.assertIs(_mrz_check_digits_valid(self.TD3_SPECIMEN.replace("7408122", "7508122")), False)
+
+    def test_unknown_length_is_not_a_verdict(self):
+        self.assertIsNone(_mrz_check_digits_valid("P<CANMARTIN<<SARAH<<<"))   # too short / not TD2
+
+
+class CrossZoneVerificationTests(SimpleTestCase):
+    """Feature 3: the printed inspection zone of a data page is cross-verified
+    against its machine readable zone, field by field."""
+
+    def _cross_check(self, rows=None):
+        frame, reader = _passport_document_inputs(rows)
+        result = _run_imajev_pipeline(frame, None, [], reader)
+        entries = [entry for entry in _log_entries(result) if entry.get("stage") == "CROSS-CHECK"]
+        self.assertEqual(len(entries), 1)
+        return result, entries[0]
+
+    def test_passport_page_is_cross_verified_with_high_consistency(self):
+        _result, entry = self._cross_check()
+        self.assertEqual(entry["status"], "APPROVED")
+        self.assertEqual(entry["action"], "approved")
+        self.assertEqual(entry["entity"], "mrz")
+        self.assertAlmostEqual(entry["consistency"], 0.994, places=3)
+        self.assertEqual(entry["distribution"],
+                         {"VIZ ↔ MRZ Consistent": 0.99, "Tampered / Mismatch": 0.01})
+        self.assertEqual(entry["reason"], "cross-zone semantic verification")
+        self.assertTrue(entry["title"])
+
+    def test_message_reports_the_matched_fields_and_icao_standard(self):
+        _result, entry = self._cross_check()
+        self.assertIn("ICAO 9303", entry["message"])
+        self.assertIn("VIZ", entry["message"])
+        self.assertIn("MRZ", entry["message"])
+        self.assertIn("99.4", entry["message"])          # calibrates on the consistency
+        for label in ("Person Name", "Passport / ID Number", "Date of Birth"):
+            self.assertIn(label, entry["matched_fields"])
+            self.assertIn(label, entry["message"])
+        self.assertEqual(entry["mismatched_fields"], [])
+        self.assertGreaterEqual(entry["compared_fields"], 4)
+
+    def test_links_spotlight_both_zones(self):
+        result, entry = self._cross_check()
+        entities = {result["detections"][index - 1].get("entity") for index in entry["detection_ids"]}
+        self.assertIn("MRZ", entities)
+        self.assertIn("PERSON", entities)
+        self.assertIn("ID_NUMBER", entities)
+
+        mrz_ids = {det["id"] for det in result["detections"] if det.get("entity") == "MRZ"}
+        viz_ids = {det["id"] for det in result["detections"]
+                   if det.get("entity") in CROSS_CHECK_VISUAL_ENTITIES}
+        self.assertEqual(set(entry["detection_ids"]), mrz_ids | viz_ids)
+
+    def test_visual_zone_that_contradicts_the_mrz_is_flagged_for_review(self):
+        """A printed surname that does not occur in the MRZ is exactly what a
+        swapped / retouched data page looks like."""
+        forged = [
+            row if row[1] not in ("MARTIN", "SARAH") else (row[0], "KHAVAREMI", row[2])
+            for row in _PASSPORT_OCR_ROWS
+        ]
+        _result, entry = self._cross_check(forged)
+        self.assertEqual(entry["status"], "REVIEW")
+        self.assertIn("Person Name", entry["mismatched_fields"])
+        self.assertLess(entry["consistency"], 0.90)
+        self.assertEqual(entry["distribution"]["VIZ ↔ MRZ Consistent"],
+                         round(entry["consistency"], 2))
+        self.assertIn("review", entry["message"])
+
+    def test_no_cross_check_without_a_machine_readable_zone(self):
+        rows = [row for row in _PASSPORT_OCR_ROWS if "P<CAN" not in row[1] and "ZE0005098" not in row[1]]
+        frame, reader = _passport_document_inputs(rows)
+        result = _run_imajev_pipeline(frame, None, [], reader)
+        self.assertEqual([entry for entry in _log_entries(result)
+                          if entry.get("stage") == "CROSS-CHECK"], [])
+
+    def test_no_cross_check_without_visual_identity_fields(self):
+        """MRZ alone (no printed name / number / date) is not a cross-check."""
+        rows = [row for row in _PASSPORT_OCR_ROWS if "P<CAN" in row[1] or "ZE0005098" in row[1]]
+        frame, reader = _passport_document_inputs(rows)
+        result = _run_imajev_pipeline(frame, None, [], reader)
+        self.assertEqual([entry for entry in _log_entries(result)
+                          if entry.get("stage") == "CROSS-CHECK"], [])
+
+    def test_cross_check_is_part_of_the_imajev_trace_only(self):
+        frame, reader = _passport_document_inputs()
+        face_patch = mock.patch.object(ModelManager, "face_model",
+                                       new_callable=mock.PropertyMock, return_value=None)
+        plate_patch = mock.patch.object(ModelManager, "plate_model",
+                                        new_callable=mock.PropertyMock, return_value=None)
+        ocr_patch = mock.patch.object(ModelManager, "ocr_reader",
+                                      new_callable=mock.PropertyMock, return_value=reader)
+        with mock.patch("anonymizer.ml_pipeline.ENABLE_NER", False), \
+                face_patch, plate_patch, ocr_patch:
+            result = analyze_image_entities(frame, use_imajev=False)
+        self.assertEqual(result["imajev_logs"], [])
+        self.assertTrue([det for det in result["detections"] if det.get("entity") == "MRZ"])
+
+    def test_mrz_compact_normalises_whitespace_case_and_misreads(self):
+        # OCR whitespace between glyphs is dropped and the line is upper-cased.
+        self.assertEqual(pii.mrz_compact("p < c a n m a r t i n<<sarah"), "P<CANMARTIN<<SARAH")
+        # Brackets never occur on a data page: they are the "<" filler.
+        self.assertEqual(pii.mrz_compact("P<CANMARTIN<<SARAH)]}"), "P<CANMARTIN<<SARAH<<<")
+        # A run of two or more K / L / C glyphs is a misread filler run ...
+        self.assertEqual(pii.mrz_compact("P<CANMARTIN<<SARAHKKK"), "P<CANMARTIN<<SARAH<<<")
+        # ... while genuine name letters (and SS / NN runs) are left alone.
+        self.assertEqual(pii.mrz_compact("P<CANERIKSSON<<ANNA"), "P<CANERIKSSON<<ANNA")
+
+    def test_direct_call_needs_both_zones(self):
+        mrz_row = {"type": "text", "entity": "MRZ", "text": "P<CANMARTIN<<SARAH" + "<" * 25,
+                   "bbox": [0, 0, 10, 10]}
+        self.assertIsNone(_cross_zone_consistency_entry([mrz_row]))
+        self.assertIsNone(_cross_zone_consistency_entry([{"type": "face", "bbox": [0, 0, 4, 4]}]))
+        self.assertIsNone(_cross_zone_consistency_entry([]))
+        self.assertIsNone(_cross_zone_consistency_entry(
+            [mrz_row, {"type": "text", "entity": "MRZ", "text": "   ", "bbox": [0, 0, 2, 2]}]))
+
+
+# --------------------------------------------------------------------------- #
+# XAI governance UI (templates, static assets)                                #
+# --------------------------------------------------------------------------- #
+
+class XaiGovernanceUiTests(SimpleTestCase):
+    """Features 1, 2 and 4 must actually ship in the rendered studio: the policy
+    selector, the live risk meter, the audit export button and the client-side
+    contract behind them (offline bundle - no build step covers the assets)."""
+
+    GOVERNANCE_MARKERS = (
+        'id="imajevPolicySelect"',
+        'value="balanced"',
+        'value="strict"',
+        'value="audit"',
+        'id="policyParamBadge"',
+        'id="privacyRiskMeter"',
+        'id="riskInitialBar"',
+        'id="riskResidualBar"',
+        'id="riskInitialValue"',
+        'id="riskResidualValue"',
+        'id="riskStatusLabel"',
+        'id="riskNarrative"',
+        'id="btnExportAudit"',
+    )
+
+    def test_index_ships_the_governance_controls(self):
+        response = self.client.get(reverse("index"))
+        self.assertEqual(response.status_code, 200)
+        for marker in self.GOVERNANCE_MARKERS:
+            self.assertContains(response, marker)
+
+    def test_policy_options_document_their_epsilon(self):
+        html = self.client.get(reverse("index")).content.decode("utf-8")
+        self.assertIn("ε = 2.0", html)          # balanced
+        self.assertIn("ε = 0.5", html)          # strict / Zero-Trust
+        self.assertIn("Zero-Trust", html)
+        self.assertIn("Fast Audit", html)
+
+    def test_index_is_a_pure_english_ltr_document(self):
+        """The studio ships as an English LTR page: no Persian UI strings and no
+        RTL isolation left in the risk meter."""
+        html = self.client.get(reverse("index")).content.decode("utf-8")
+        self.assertIn('<html lang="en" dir="ltr"', html)
+        self.assertIn("Initial Risk", html)
+        self.assertIn("Residual Risk", html)
+        self.assertIn("Re-Identification Risk Meter", html)
+        self.assertNotIn("dir=\"rtl\"", html)
+        persian = [ch for ch in html if "\u0600" <= ch <= "\u06ff"]
+        self.assertEqual(persian, [], f"Persian characters left in the template: {persian[:20]}")
+
+    def test_shipped_javascript_carries_the_xai_contract(self):
+        from pathlib import Path
+
+        from django.conf import settings
+
+        script = (Path(settings.BASE_DIR) / "static" / "js" / "app.js").read_text(encoding="utf-8")
+        for marker in (
+            "privacy-audit-report.json",
+            "value_sha256_prefix",
+            "imajev_reasoning_trace",
+            "sha256Hex",
+            "buildAuditReport",
+            "spotlightDetectionIds",
+            "linkedIdsOf",
+            "policyProfiles",
+            "computeRiskAssessment",
+            "highlightLogCard",
+        ):
+            self.assertIn(marker, script)
+
+    def test_shipped_stylesheet_carries_the_spotlight_states(self):
+        from pathlib import Path
+
+        from django.conf import settings
+
+        css = (Path(settings.BASE_DIR) / "static" / "css" / "style.css").read_text(encoding="utf-8")
+        for marker in (".imajev-log-card-linked", ".log-card-linked-active",
+                       "#riskInitialBar", "#riskResidualBar"):
+            self.assertIn(marker, css)
 
 
 # --------------------------------------------------------------------------- #

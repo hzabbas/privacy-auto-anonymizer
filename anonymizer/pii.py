@@ -50,22 +50,22 @@ class PIISpan:
 # IP_ADDRESS outranks PHONE because a dotted quad is far more specific than the
 # (deliberately lenient) libphonenumber matcher that can also read it as a phone.
 ENTITY_INFO = {
-    "CREDIT_CARD": ("Credit card", 100),
+    "CREDIT_CARD": ("Credit Card", 100),
     "IBAN": ("IBAN", 100),
     "SSN": ("SSN", 100),
     # A full MRZ line outranks everything inside it: the line itself is the
     # machine-readable copy of the document's identity fields.
-    "MRZ": ("MRZ", 98),
-    "SECRET": ("Secret / key", 95),
-    "EMAIL": ("Email", 90),
-    "IP_ADDRESS": ("IP address", 88),
-    "PHONE": ("Phone", 85),
-    "ID_NUMBER": ("ID number", 80),
-    "DATE_OF_BIRTH": ("Date of birth", 75),
+    "MRZ": ("MRZ (Machine Readable Zone)", 98),
+    "SECRET": ("API Key / Secret", 95),
+    "EMAIL": ("Email Address", 90),
+    "IP_ADDRESS": ("IP Address", 88),
+    "PHONE": ("Phone Number", 85),
+    "ID_NUMBER": ("Passport / ID Number", 80),
+    "DATE_OF_BIRTH": ("Date of Birth", 75),
     "DATE": ("Date", 70),
-    "ADDRESS": ("Address", 65),
+    "ADDRESS": ("Street Address", 65),
     "URL": ("URL", 60),
-    "PERSON": ("Person name", 55),
+    "PERSON": ("Person Name", 55),
     "LOCATION": ("Location", 50),
 }
 
@@ -1082,6 +1082,19 @@ def _mrz_document_number(part: str) -> str:
     if any(code in doc for code in _MRZ_STATE_CODES):
         return ""
     return doc
+
+
+def mrz_compact(text: str) -> str:
+    """
+    Normalises one machine-readable line for comparison purposes: whitespace is
+    dropped (OCR often inserts it between glyphs), the line is upper-cased and
+    the "<" fillers that OCR misread (K / L / C runs, brackets) are restored.
+
+    Public entry point of the MRZ repair logic: the cross-zone verifier in
+    ``ml_pipeline`` compares printed (VIZ) values against these compact lines,
+    so both sides of the comparison use exactly the same normalisation.
+    """
+    return _repair_mrz_fillers(re.sub(r"\s+", "", str(text).upper()))
 
 
 def _mrz_spans(text: str) -> List[PIISpan]:

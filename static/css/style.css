@@ -8,7 +8,9 @@
    ========================================================================== */
 
 /* --- Self-hosted fonts --------------------------------------------------- */
-/* Vazirmatn carries the Persian/Arabic script ... */
+/* Inter + JetBrains Mono carry the English interface; Vazirmatn is kept in the
+   stack as the Arabic/Persian script fallback, because documents (and therefore
+   OCR output shown in the terminal) may contain those scripts. */
 @font-face {
     font-family: 'Vazirmatn';
     font-style: normal;
@@ -204,6 +206,60 @@ body {
     }
 }
 
+/* --- Interactive XAI cards (terminal <-> canvas spotlight) --------------- */
+/* A card that points at a detection must *look* clickable: the left rail turns
+   cyan on hover and the whole card is nudged out of the log flow. The rail is a
+   ::before pseudo-element so the markup of the card stays a plain flex column. */
+.imajev-log-card-linked {
+    position: relative;
+}
+.imajev-log-card-linked::before {
+    content: '';
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    width: 2px;
+    background: linear-gradient(180deg, rgba(34, 211, 238, 0.15), rgba(34, 211, 238, 0.85), rgba(34, 211, 238, 0.15));
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.imajev-log-card-linked:hover::before {
+    opacity: 1;
+}
+.imajev-log-card-linked:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.35), 0 6px 18px rgba(0, 0, 0, 0.55);
+}
+.imajev-log-card-linked:focus-visible {
+    outline: 2px solid #22d3ee;
+    outline-offset: 1px;
+}
+
+/* Reverse link: the canvas / HUD badge flashes the card that judged it. */
+.imajev-log-card-linked.log-card-linked-active {
+    border-color: rgba(251, 191, 36, 0.85) !important;
+    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.28), 0 0 20px rgba(251, 191, 36, 0.22) !important;
+}
+.imajev-log-card-linked.log-card-linked-active::before {
+    opacity: 1;
+    background: linear-gradient(180deg, rgba(251, 191, 36, 0.2), rgba(251, 191, 36, 0.95), rgba(251, 191, 36, 0.2));
+}
+
+/* --- Privacy risk meter ------------------------------------------------- */
+/* The bars are painted from JS (width + colour) so the two bands can cross-fade
+   through one transition instead of swapping utility classes. */
+#privacyRiskMeter {
+    min-height: 0;
+}
+#riskInitialBar,
+#riskResidualBar {
+    transition: width 0.7s cubic-bezier(0.22, 1, 0.36, 1),
+        background-color 0.4s ease, box-shadow 0.4s ease;
+}
+#riskStatusLabel {
+    transition: color 0.4s ease, background-color 0.4s ease, border-color 0.4s ease;
+}
+
 /* --- Motion preferences -------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
     *,
@@ -216,10 +272,11 @@ body {
 }
 
 /* --- Terminal log messages (bidi-safe) ------------------------------------ */
-/* Log messages mix Persian prose with Latin tokens (OCR, MRZ, PII), numbers
-   and parenthesised percentages. app.js sets an explicit dir="rtl"/"ltr" per
-   message and wraps every technical run in <bdi>; these rules make the
-   isolation a documented contract instead of a per-site accident. */
+/* The interface is English (LTR), but a log message can echo a document's own
+   content, which may be in another script. app.js gives every message an
+   explicit direction from its first strong character and wraps each technical
+   run (OCR, MRZ, percentages) in <bdi>; these rules make that isolation a
+   documented contract instead of a per-site accident. */
 .imajev-log-message {
     unicode-bidi: isolate;
 }

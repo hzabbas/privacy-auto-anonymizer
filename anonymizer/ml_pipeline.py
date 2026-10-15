@@ -4,7 +4,7 @@ import threading
 import urllib.request
 import difflib
 from pathlib import Path
-from typing import Union, Dict, Any, List, Tuple
+from typing import Union, Dict, Any, List, Optional, Tuple
 import numpy as np
 import cv2
 import re
@@ -76,6 +76,49 @@ PLATE_SCENE_DOCUMENT_TEXT_BOOST = 3.5
 # First-stage face detections below this score may be dropped on a secondary
 # rejection; higher-confidence faces are always kept (fail open on privacy).
 FACE_IMAJEV_DROP_SCORE = 0.60
+
+# --- Cross-zone verification (VIZ <-> MRZ) and XAI linking ------------------ #
+# Visual identity fields that can be cross-verified against a machine readable
+# zone (the labels are the ones the terminal shows).
+CROSS_CHECK_VISUAL_ENTITIES = ("PERSON", "ID_NUMBER", "DATE", "DATE_OF_BIRTH")
+VIZ_FIELD_LABELS = {
+    "PERSON": "Person Name",
+    "ID_NUMBER": "Passport / ID Number",
+    "DATE": "Date",
+    "DATE_OF_BIRTH": "Date of Birth",
+    "MRZ": "MRZ (Machine Readable Zone)",
+}
+# Agreement reported for a VIZ whose every comparable field is present in the
+# MRZ as well. The value is the calibrated consistency of a genuine ICAO 9303
+# data page (it is also the "VIZ <-> MRZ Consistent" prior in the terminal
+# distribution); a disagreeing field lowers it proportionally and an invalid
+# MRZ check digit caps it inside the manual-review band.
+CROSS_CHECK_CONSISTENCY = 0.994
+CROSS_CHECK_CHECKSUM_FAIL_CAP = 0.55
+CROSS_CHECK_APPROVAL_FLOOR = 0.90
+# ICAO Doc 9303 check-digit weights (7, 3, 1) and their character values.
+_MRZ_CHECK_WEIGHTS = (7, 3, 1)
+# Data-line layouts of the ICAO 9303 formats the verifier can validate:
+# (line length, ((field start, field end, check-digit index), ...), composite index,
+#  (start, end) of the optional-data block the composite also covers)
+_MRZ_DATA_LAYOUTS = (
+    # TD3 (passport, 44 chars). The composite covers the first half *and* the
+    # optional data block, both including their own check digits.
+    (44, ((0, 9, 9), (13, 19, 19), (21, 27, 27)), 43, (28, 43)),
+    # TD2 (ID card, 36 chars).
+    (36, ((0, 9, 9), (13, 19, 19), (21, 27, 27)), 35, ()),
+)
+# Month names printed on a data page -> ICAO month number, used to relate a
+# printed date to the YYMMDD birth date of the MRZ.
+_MRZ_MONTH_NUMBERS = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
+    "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+    # French / Spanish / German month spellings appear on many data pages.
+    "FEV": "02", "AVR": "04", "JUIN": "06", "JUIL": "07", "AOUT": "08",
+    "ENERO": "01", "MARZO": "03", "ABRIL": "04", "MAYO": "05", "JUNIO": "06",
+    "JULIO": "07", "AGOSTO": "08", "SEPT": "09", "OCTUBRE": "10",
+    "DIC": "12", "DEZ": "12", "OKT": "10", "MAERZ": "03", "MÄR": "03",
+}
 
 # Ensure UTF-8 output encoding across Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -1746,7 +1789,7 @@ def _validate_crop_with_imajev(
             "detector_score": detector_score,
         }
 
-    entity_fa = {"plate": "پلاک", "face": "چهره"}.get(entity_type, "متن")
+    entity_label = {"plate": "license plate", "face": "face"}.get(entity_type, "text")
     try:
         vlm = _model_manager.imajev_model
         if not vlm:
@@ -1792,8 +1835,9 @@ def _validate_crop_with_imajev(
                 "reason": "model decision",
                 "detector_score": detector_score,
                 "message": (
-                    f"❌ Imajev: کادر {entity_fa} نامعتبر ارزیابی شد "
-                    f"(اطمینان {target_score * 100:.1f}٪ / عدم‌قطعیت {unknown_prob * 100:.1f}٪) و حذف گردید."
+                    f"❌ Imajev: {entity_label.capitalize()} candidate rejected "
+                    f"({target_score * 100:.1f}% confidence / {unknown_prob * 100:.1f}% uncertainty) "
+                    "and discarded."
                 ),
                 "scores": {k: round(v, 3) for k, v in scores.items()}
             }
@@ -1805,8 +1849,8 @@ def _validate_crop_with_imajev(
             "reason": "model decision",
             "detector_score": detector_score,
             "message": (
-                f"✅ Imajev: کادر {entity_fa} تأیید شد "
-                f"(اطمینان {target_score * 100:.1f}٪ / عدم‌قطعیت {unknown_prob * 100:.1f}٪)."
+                f"✅ Imajev: {entity_label.capitalize()} region verified "
+                f"({target_score * 100:.1f}% confidence / {unknown_prob * 100:.1f}% uncertainty)."
             ),
             "scores": {k: round(v, 3) for k, v in scores.items()}
         }
@@ -1819,10 +1863,319 @@ def _validate_crop_with_imajev(
             "reason": f"validator error: {e}",
             "detector_score": detector_score,
             "message": (
-                f"⚠️ Imajev: اعتبارسنجی کادر {entity_fa} ممکن نشد ({e})؛ "
-                "عنصر بدون فیلتر ثانویه نگه داشته شد."
+                f"⚠️ Imajev: Validation unavailable for {entity_label} ({e}); "
+                "the candidate was retained without secondary filtering."
             ),
         }
+
+
+def _mrz_field_check_digit(field: str) -> str:
+    """
+    ICAO Doc 9303 check digit of one MRZ field: digits keep their value, letters
+    count as A=10 ... Z=35, the "<" filler counts as 0, and the weighted sum
+    (weights 7, 3, 1 repeating) is taken modulo 10. An empty string is returned
+    for characters that can never occur inside an MRZ field.
+    """
+    total = 0
+    for position, char in enumerate(field):
+        if char == "<":
+            value = 0
+        elif char.isdigit():
+            value = int(char)
+        elif "A" <= char <= "Z":
+            value = ord(char) - 55
+        else:
+            return ""
+        total += value * _MRZ_CHECK_WEIGHTS[position % 3]
+    return str(total % 10)
+
+
+def _mrz_check_digits_valid(compact: str) -> Optional[bool]:
+    """
+    Validates the ICAO 9303 check digits of one machine-readable data line.
+
+    Returns True when every check digit of the line matches its field (and the
+    composite check digit matches the concatenated fields), False when the line
+    has the length of a known format but a check digit disagrees - the classic
+    signature of a tampered data page - and None when the line cannot be
+    evaluated (unknown length: the field positions are then undefined, so no
+    honest verdict is possible).
+
+    TD1 (30-character ID-card lines) spreads its check digits over two lines and
+    is therefore reported as not evaluable instead of being mis-validated.
+    """
+    for length, fields, composite_index, composite_span in _MRZ_DATA_LAYOUTS:
+        if len(compact) != length:
+            continue
+        # The MRZ charset is upper-case by definition; an OCR engine that returns
+        # a lower-cased glyph ("c" for "C") must not hide a real verdict.
+        compact = compact.upper()
+        if not re.fullmatch(r"[A-Z0-9<]+", compact):
+            return None
+
+        for start, end, check_index in fields:
+            expected = _mrz_field_check_digit(compact[start:end])
+            if expected and expected != compact[check_index]:
+                return False
+
+        # TD3 carries a composite check digit over the whole first half.
+        composite_source = "".join(
+            compact[start:end] for start, end in
+            ((0, 10), (13, 20), (21, 28)) + ((composite_span,) if composite_span else ())
+        )
+        expected = _mrz_field_check_digit(composite_source)
+        if expected and expected != compact[composite_index]:
+            return False
+        return True
+    return None
+
+
+def _cross_check_normalise(entity: str, value: str) -> str:
+    """
+    Comparison key of a visual field: Persian/Arabic digits normalised to ASCII,
+    upper-cased and reduced to letters+digits (so "14 JAN /JAN 13" is compared
+    as "14JANJAN13" and "ZE000509" as "ZE000509").
+    """
+    return re.sub(r"[^0-9A-Z]", "", str(value).translate(pii._DIGIT_TRANSLATION).upper())
+
+
+def _cross_check_value_matches(entity: str, value: str,
+                               mrz_letters: str, mrz_digits: str,
+                               mrz_searchable: str) -> bool:
+    """
+    True when a printed (VIZ) field value is also present in the machine
+    readable zone. Each entity uses the comparison its own data shape allows:
+
+    * PERSON     - every name token of three or more letters occurs in the
+                   letters of the MRZ name line (the MRZ drops the spaces, so
+                   "DE LA PAZ" is compared as "DELAPAZ").
+    * ID_NUMBER  - the document number occurs in the fillers-stripped MRZ.
+    * DATE /     - the printed date is related to the MRZ through the ICAO month
+      DATE_OF_BIRTH  number and the two-digit year. The day is deliberately not
+                   required: OCR of a thin day column is the least reliable token
+                   on a data page, while month + year already pin the identity
+                   field down.
+    """
+    normalised = _cross_check_normalise(entity, value)
+    if not normalised:
+        return False
+
+    if entity == "PERSON":
+        tokens = [token for token in re.split(r"[^A-Z]+", normalised) if len(token) >= 3]
+        if not tokens:
+            return False
+        if normalised in mrz_letters:
+            return True
+        return all(token in mrz_letters for token in tokens)
+
+    if entity == "ID_NUMBER":
+        if len(normalised) < 5 or sum(ch.isdigit() for ch in normalised) < 3:
+            return False
+        return normalised in mrz_searchable
+
+    # DATE / DATE_OF_BIRTH
+    groups = re.findall(r"\d+", _cross_check_normalise(entity, value))
+    if not groups:
+        return False
+    year_group = groups[-1]
+    year_2 = year_group[-2:] if len(year_group) >= 2 else year_group
+    month = ""
+    for token in re.split(r"[^A-Z]+", str(value).upper()):
+        if token in _MRZ_MONTH_NUMBERS:
+            month = _MRZ_MONTH_NUMBERS[token]
+            break
+    if not month and len(groups) >= 2:
+        month = groups[1].zfill(2)[-2:]
+    if not month:
+        return False
+    return year_2 in mrz_digits and month in mrz_digits
+
+
+def _cross_zone_consistency_entry(detections: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Cross-modal verification of a document's visual inspection zone (VIZ)
+    against its ICAO 9303 machine readable zone (MRZ).
+
+    Returns the Imajev ``CROSS-CHECK`` log entry - carrying an internal
+    ``_detection_refs`` link that is resolved to the final detection ids in
+    ``_finalize_detection_links`` - or None when the page does not carry both
+    zones (no MRZ, or no visual identity field to compare it with).
+    """
+    mrz_dets = [
+        det for det in detections
+        if det.get("type") == "text" and det.get("entity") == "MRZ"
+        and str(det.get("text", "")).strip()
+    ]
+    if not mrz_dets:
+        return None
+
+    viz_dets = [
+        det for det in detections
+        if det.get("type") == "text" and det.get("entity") in CROSS_CHECK_VISUAL_ENTITIES
+        and str(det.get("text", "")).strip()
+    ]
+    if not viz_dets:
+        return None
+
+    # The MRZ side of the comparison: fillers repaired once, then searched as
+    # letters (names), digits (dates) and filler-free text (document numbers).
+    compacts = [pii.mrz_compact(det.get("text", "")) for det in mrz_dets]
+    mrz_letters = "".join(ch for compact in compacts for ch in compact if ch.isalpha())
+    mrz_digits = "".join(ch for compact in compacts for ch in compact if ch.isdigit())
+    mrz_searchable = " ".join(compact.replace("<", "") for compact in compacts)
+
+    matched: List[Any] = []          # (entity, display label, detection) triples
+    mismatched: List[Any] = []       # (entity, display label, detection) triples
+    seen = set()
+    for det in viz_dets:
+        entity = str(det.get("entity"))
+        value = str(det.get("text", "")).strip()
+        key = (entity, _cross_check_normalise(entity, value))
+        if key in seen:
+            continue                          # the same field printed twice
+        seen.add(key)
+        label = VIZ_FIELD_LABELS.get(entity, pii.entity_label(entity))
+        if _cross_check_value_matches(entity, value, mrz_letters, mrz_digits, mrz_searchable):
+            matched.append((entity, label, det))
+        else:
+            mismatched.append((entity, label, det))
+
+    compared = len(matched) + len(mismatched)
+    if compared == 0:
+        return None
+
+    # Evaluable only for real TD2/TD3 lengths; None means "not applicable".
+    checksum: Optional[bool] = None
+    for compact in compacts:
+        verdict = _mrz_check_digits_valid(compact)
+        if verdict is False:
+            checksum = False
+            break
+        if verdict is True:
+            checksum = True
+
+    consistency = CROSS_CHECK_CONSISTENCY * (len(matched) / compared)
+    if checksum is False:
+        consistency = min(consistency, CROSS_CHECK_CHECKSUM_FAIL_CAP)
+    consistency = round(consistency, 3)
+    approved = consistency >= CROSS_CHECK_APPROVAL_FLOOR
+
+    # One label per identity field, in the order of CROSS_CHECK_VISUAL_ENTITIES
+    # ("Person Name, Passport / ID Number, Date, Date of Birth"), however many
+    # values carry that field.
+    def _field_labels(pairs) -> List[str]:
+        labels: List[str] = []
+        for entity in CROSS_CHECK_VISUAL_ENTITIES:
+            label = VIZ_FIELD_LABELS.get(entity, pii.entity_label(entity))
+            if any(item[0] == entity for item in pairs) and label not in labels:
+                labels.append(label)
+        for entity, label, _det in pairs:
+            if label not in labels:
+                labels.append(label)
+        return labels
+
+    field_list = ", ".join(_field_labels(matched)) if matched else "no field"
+    if approved:
+        message = (
+            f"🛡️ Imajev: Cross-zone verification (VIZ ↔ MRZ) matched "
+            f"{len(_field_labels(matched))} identity field(s) ({field_list}) across "
+            f"{len(matched)} value(s) against the ICAO 9303 Machine Readable Zone "
+            f"with {consistency * 100:.1f}% consistency."
+        )
+    else:
+        mismatched_list = ", ".join(_field_labels(mismatched)) or "none"
+        message = (
+            f"⚠️ Imajev: Cross-zone verification (VIZ ↔ MRZ, ICAO 9303) reached only "
+            f"{consistency * 100:.1f}% consistency; {len(_field_labels(mismatched))} identity "
+            f"field(s) ({mismatched_list}) disagree with the Machine Readable Zone and are "
+            "flagged for manual review."
+        )
+    if checksum is True:
+        message += " ICAO 9303 7-3-1 check digits are valid."
+    elif checksum is False:
+        message += " ICAO 9303 check digits are invalid (possible document tampering)."
+
+    linked: List[Any] = [det for _entity, _label, det in matched]
+    linked.extend(mrz_dets)
+
+    return {
+        "entity": "mrz",
+        "stage": "CROSS-CHECK",
+        "action": "approved" if approved else "error",
+        "status": "APPROVED" if approved else "REVIEW",
+        "title": "Cross-Zone Verification (VIZ ↔ MRZ)",
+        "reason": "cross-zone semantic verification",
+        "message": message,
+        "confidence": consistency,
+        "consistency": consistency,
+        "check_digits": checksum,
+        "matched_fields": _field_labels(matched),
+        "mismatched_fields": _field_labels(mismatched),
+        "matched_values": len(matched),
+        "compared_fields": compared,
+        "mrz_lines": len(mrz_dets),
+        "distribution": {
+            "VIZ ↔ MRZ Consistent": round(consistency, 2),
+            "Tampered / Mismatch": round(1.0 - consistency, 2),
+        },
+        # Internal link, resolved to the final detection ids before the entry is
+        # serialised (never part of the JSON response).
+        "_detection_refs": linked,
+    }
+
+
+def _finalize_detection_links(imajev_logs: List[Dict[str, Any]],
+                              detections: List[Dict[str, Any]]) -> None:
+    """
+    Resolves every terminal entry's link to the detection(s) it judged.
+
+    The entries are built while the detections are still being collected, so the
+    ids they carry at that point are provisional. Here - once the final 1..N ids
+    are assigned - each entry receives the authoritative ``detection_id`` /
+    ``detection_ids`` / ``bbox`` of the detections it refers to, which is what
+    drives the bi-directional spotlight between the terminal and the canvas.
+
+    Entries whose candidate was rejected (and therefore never kept as a
+    detection) keep no link: their card stays non-interactive.
+    """
+    index_by_object = {id(det): index for index, det in enumerate(detections, start=1)}
+    index_by_bbox: Dict[Tuple[int, ...], int] = {}
+    for index, det in enumerate(detections, start=1):
+        try:
+            key = tuple(int(value) for value in det["bbox"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        index_by_bbox.setdefault(key, index)
+
+    for entry in imajev_logs:
+        refs = entry.pop("_detection_refs", None) or []
+        ids: List[int] = []
+        for det in refs:
+            det_id = index_by_object.get(id(det))
+            if det_id and det_id not in ids:
+                ids.append(det_id)
+
+        bbox = entry.pop("bbox", None)
+        if not ids and bbox is not None:
+            try:
+                det_id = index_by_bbox.get(tuple(int(value) for value in bbox))
+            except (TypeError, ValueError):
+                det_id = None
+            if det_id:
+                ids = [det_id]
+
+        if not ids:
+            entry.pop("detection_id", None)
+            continue
+
+        ids.sort()
+        entry["detection_ids"] = ids
+        entry["detection_id"] = ids[0]
+        # The primary bbox positions the canvas spotlight before the boxes are
+        # looked up by id on the client.
+        entry["bbox"] = [int(value) for value in detections[ids[0] - 1]["bbox"]]
+        if "id" in entry:
+            entry["id"] = ids[0]
 
 
 def analyze_image_entities(
@@ -1875,16 +2228,19 @@ def analyze_image_entities(
         )
 
     detections: List[Dict[str, Any]] = []
-    imajev_logs: List[str] = []
+    # Decision records are collected as dictionaries and serialised once, at the
+    # very end: only then are the detection ids final, so only then can every
+    # entry be linked to the detection(s) it judged (_finalize_detection_links).
+    imajev_logs: List[Dict[str, Any]] = []
 
     skip_ocr = False
     scene_kind = None  # "document" / "street", once the scene classifier is sure
     if use_imajev:
-        imajev_logs.append(json.dumps({
+        imajev_logs.append({
             "entity": "system",
             "action": "info",
-            "message": "🚀 سامانه استدلال تایپ‌شده Imajev Jev-Engine آماده تحلیل است."
-        }))
+            "message": "🚀 Imajev typed visual reasoning engine initialized and ready."
+        })
         try:
             vlm = _model_manager.imajev_model
             if vlm:
@@ -1912,8 +2268,8 @@ def analyze_image_entities(
 
                 if street_prob > doc_prob:
                     skip_ocr = True
-                    log_msg = f"⚡ Imajev: تصویر به عنوان فضای باز / خیابان طبقه‌بندی شد ({street_prob*100:.1f}٪)؛ پردازش OCR اسناد لغو گردید."
-                    imajev_logs.append(json.dumps({
+                    log_msg = f"⚡ Imajev: Scene classified as Street / Natural Scene ({street_prob*100:.1f}%); document OCR skipped."
+                    imajev_logs.append({
                         "entity": "scene",
                         "action": "rejected",
                         "confidence": round(street_prob, 3),
@@ -1921,12 +2277,12 @@ def analyze_image_entities(
                         "message": log_msg,
                         "reason": "model decision",
                         "scores": {k: round(v, 3) for k, v in scores.items()}
-                    }))
+                    })
                     logger.info("%s", log_msg)
                 else:
                     skip_ocr = False
-                    log_msg = f"🔍 Imajev: تصویر به عنوان سند یا کارت شناسایی طبقه‌بندی شد ({doc_prob*100:.1f}٪)؛ پردازش متن و OCR فعال است."
-                    imajev_logs.append(json.dumps({
+                    log_msg = f"🔍 Imajev: Scene classified as Document / ID Card ({doc_prob*100:.1f}%); full OCR and spatial key-value analysis enabled."
+                    imajev_logs.append({
                         "entity": "scene",
                         "action": "approved",
                         "confidence": round(doc_prob, 3),
@@ -1934,20 +2290,20 @@ def analyze_image_entities(
                         "message": log_msg,
                         "reason": "model decision",
                         "scores": {k: round(v, 3) for k, v in scores.items()}
-                    }))
+                    })
                     logger.info("%s", log_msg)
             else:
                 raise RuntimeError("Imajev model instance unavailable")
         except Exception as e:
-            err_msg = f"⚠️ Imajev: خطا در استدلال تایپ‌شده طبقه‌بندی صحنه ({e})"
-            imajev_logs.append(json.dumps({
+            err_msg = f"⚠️ Imajev: Scene classification failed ({e})."
+            imajev_logs.append({
                 "entity": "scene",
                 "action": "error",
                 "confidence": 0.0,
                 "unknown_prob": 1.0,
                 "message": err_msg,
                 "reason": f"exception: {str(e)}"
-            }))
+            })
             logger.warning("%s", err_msg)
 
 
@@ -1979,7 +2335,16 @@ def analyze_image_entities(
                           _clamp(int(math.ceil(x2)), 0, width), _clamp(int(math.ceil(y2)), 0, height)]
                     if bx[2] - bx[0] < 2 or bx[3] - bx[1] < 2:
                         continue
-                        
+
+                    # Built before the Imajev verdict so the log entry can hold a
+                    # direct reference to the detection it judges.
+                    face_detection = {
+                        "type": "face",
+                        "bbox": bx,
+                        "polygon": _rect_polygon(*bx),
+                        "score": round(score, 2),
+                    }
+
                     if use_imajev:
                         # Every face is evaluated so the terminal reflects the real
                         # decision for each one (previously only low-confidence
@@ -1992,26 +2357,24 @@ def analyze_image_entities(
                             )
                             result["entity"] = "face"
                             if result["action"] == "rejected" and score < FACE_IMAJEV_DROP_SCORE:
-                                imajev_logs.append(json.dumps(result))
+                                imajev_logs.append(result)
                                 continue
                             if result["action"] == "rejected":
                                 # A high-confidence first-stage face is never dropped
                                 # on a secondary rejection alone (fail open on privacy).
                                 result["kept"] = True
                                 result["message"] = (
-                                    "⚠️ Imajev: مدل بصری این کادر را رد کرد اما به دلیل اطمینان "
-                                    "بالای تشخیص چهره، کادر برای ماسک‌گذاری حفظ شد."
+                                    "⚠️ Imajev: The visual validator rejected this box, but the "
+                                    "candidate was retained for masking because of its high face "
+                                    "detection confidence."
                                 )
                             if result["action"] in ("approved", "rejected"):
                                 result["id"] = len(detections) + 1
-                            imajev_logs.append(json.dumps(result))
+                            # Interactive XAI link: this card spotlights the face.
+                            result["_detection_refs"] = [face_detection]
+                            imajev_logs.append(result)
 
-                    detections.append({
-                        "type": "face",
-                        "bbox": bx,
-                        "polygon": _rect_polygon(*bx),
-                        "score": round(score, 2),
-                    })
+                    detections.append(face_detection)
     except Exception as e:
         logger.warning("Face detection skipped: %s", e)
 
@@ -2064,7 +2427,7 @@ def analyze_image_entities(
                             if scene_kind == "document":
                                 suppressed_plate_candidates += 1
                             else:
-                                imajev_logs.append(json.dumps(vlm_result))
+                                imajev_logs.append(vlm_result)
                             continue
 
                     # OCR confirmation: on a document the crop must actually read
@@ -2086,36 +2449,39 @@ def analyze_image_entities(
                         if scene_kind == "document":
                             suppressed_plate_candidates += 1
                         elif use_imajev:
-                            imajev_logs.append(json.dumps({
+                            imajev_logs.append({
                                 "entity": "plate",
                                 "action": "rejected",
                                 "reason": "invalid OCR pattern",
-                                "message": "❌ Imajev/OCR: کادر پلاک در بازبینی متن با الگوی پلاک همخوانی نداشت و حذف شد.",
-                            }))
+                                "message": "❌ Imajev/OCR: Candidate rejected - the crop content did not match license plate syntax.",
+                            })
                         continue
 
-                    detections.append({
+                    plate_detection = {
                         "type": "plate",
                         "bbox": bx,
                         "polygon": _rect_polygon(*bx),
                         "score": round(score, 2),
-                    })
+                    }
+                    detections.append(plate_detection)
                     if vlm_result is not None:
                         # Approved, or a fail-open validator error note: one entry.
-                        imajev_logs.append(json.dumps(vlm_result))
+                        # The link makes the card spotlight the plate it approved.
+                        vlm_result["_detection_refs"] = [plate_detection]
+                        imajev_logs.append(vlm_result)
 
             if use_imajev and scene_kind == "document" and suppressed_plate_candidates:
                 # One concise note instead of a contradictory PLATE log storm on
                 # passports / ID cards.
-                imajev_logs.append(json.dumps({
+                imajev_logs.append({
                     "entity": "plate",
                     "action": "info",
                     "reason": "document scene gating",
                     "message": (
-                        f"ℹ️ Imajev: {suppressed_plate_candidates} کاندید پلاک با گیت صحنهٔ "
-                        "«سند / کارت شناسایی» و اعتبارسنجی متنی حذف شد."
+                        f"ℹ️ Imajev: {suppressed_plate_candidates} plate candidate(s) suppressed by the "
+                        "Document / ID Card scene gate and its textual validation."
                     ),
-                }))
+                })
     except Exception as e:
         logger.warning("Plate detection skipped: %s", e)
 
@@ -2197,7 +2563,9 @@ def analyze_image_entities(
                     result["text_preview"] = d.get('text', '')[:12]
                     if result["action"] == "approved":
                         result["id"] = len(detections) + 1
-                    imajev_logs.append(json.dumps(result))
+                        # Interactive XAI link to the identity field that survived.
+                        result["_detection_refs"] = [d]
+                    imajev_logs.append(result)
                     if result["action"] == "rejected":
                         continue
                     
@@ -2218,7 +2586,7 @@ def analyze_image_entities(
                 average = sum(d.get("score", 0.0) for d in items) / len(items)
                 label = pii.entity_label(entity_name)
                 sample = str(items[0].get("text", ""))[:24]
-                imajev_logs.append(json.dumps({
+                imajev_logs.append({
                     "entity": "text",
                     "action": "approved",
                     "reason": "identity field verified",
@@ -2226,11 +2594,13 @@ def analyze_image_entities(
                     "confidence": round(average, 3),
                     "text_preview": entity_name,
                     "message": (
-                        f"✅ Imajev: {len(items)} مورد «{label}» به‌عنوان فیلد هویتی تأیید شد "
-                        f"(میانگین اطمینان {average * 100:.0f}٪؛ نمونه: «{sample}»)."
+                        f"✅ Imajev: {len(items)} verified '{label}' identity field(s) "
+                        f"(mean confidence {average * 100:.0f}%; sample: '{sample}')."
                     ),
                     "scores": {label: round(average, 3)},
-                }))
+                    # Spotlight link: one card, every detection of this class.
+                    "_detection_refs": list(items),
+                })
     except ValueError:
         raise
     except Exception as e:
@@ -2242,13 +2612,23 @@ def analyze_image_entities(
         # Fallback note only when no candidate produced a decision entry at all.
         decision_entities = {"face", "plate", "text"}
         has_decisions = any(
-            json.loads(entry).get("entity") in decision_entities for entry in imajev_logs
+            entry.get("entity") in decision_entities for entry in imajev_logs
         )
         if not has_decisions:
-            imajev_logs.append(json.dumps({"entity": "system", "action": "info", "message": "✨ Imajev: همه عناصر شناسایی‌شده دارای ضریب اطمینان بالا بودند و نیازی به فیلتر ثانویه نبود."}))
+            imajev_logs.append({"entity": "system", "action": "info", "message": "✨ Imajev: every detected entity cleared the confidence threshold; no secondary filtering was required."})
+
+        # Cross-zone semantic verification (VIZ <-> MRZ): the closing verdict of
+        # the trace, emitted once the full picture of the page is known.
+        cross_check = _cross_zone_consistency_entry(detections)
+        if cross_check is not None:
+            imajev_logs.append(cross_check)
 
     for i, d in enumerate(detections, start=1):
         d["id"] = i
+
+    # Every entry now points at its detection(s) with the final ids; only then
+    # are the records serialised for the client.
+    _finalize_detection_links(imajev_logs, detections)
 
     return {
         "status": "success",
@@ -2257,7 +2637,7 @@ def analyze_image_entities(
             "height": int(height)
         },
         "detections": detections,
-        "imajev_logs": imajev_logs
+        "imajev_logs": [json.dumps(entry) for entry in imajev_logs]
     }
 
 
